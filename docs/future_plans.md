@@ -84,10 +84,22 @@ shapes essentially unchanged for most (richards +72 real precision); states and
 monomorphism unchanged. +5 tests (185 total). `sort`/`replace` callbacks are *not*
 invoked (returned soundly, ignoring the fn) — that is Phase 3.
 
-### Phase 3 — higher-order builtins (HARD, TODO)
-`map`/`forEach`/`filter`/`reduce`/`some`/`every`/`sort(cmp)` must *invoke the user
-callback* through the analysis (spawn `enterClosure` on element values, thread the
-result back). Crypto/jsbn doesn't need these; needed for functional-style code.
+### Phase 3 — higher-order builtins — DONE (2026-07)
+`map`/`flatMap`/`forEach`/`filter`/`find`/`findIndex`/`some`/`every`/`reduce`/
+`reduceRight`/`sort` invoke the user callback through the machine. Mechanism: a new
+`collect?: OAddr` continuation-frame variant (state.ts `Kont`) — on the callback's
+return, the value is weak-added to the result array's elements and *that array* is
+bound (this is `map`). `reduce` threads acc = init ⊔ element and binds the callback's
+return. The rest pre-bind a synchronous result and run the callback for effect (a
+discard frame, mirroring setter dispatch). The callback is entered **once** with the
+index-insensitive smashed element value, so the fixpoint covers all elements with **no
+state explosion** (nested maps < 40 states; Octane benchmarks byte-identical on/off,
+since none use HOFs). **Precision = coverage:** a function used only as a `map`
+callback goes from *unanalyzed/invisible* (off) to fully specialized `(num)→num` (on),
+and the result array is precisely typed (`[1,2,3].map(x=>x*2)[0]` = `{2,4,6}`). +7
+tests (192 total). Approximations: `sort`/`replace` comparators are called but ordering
+is index-insensitive; `reduce`'s accumulator fixpoint is approximated (init ⊔ element),
+not iterated — revisit if a workload needs precise fold typing.
 
 ### Coverage is open-ended
 Beyond the phases, full stdlib coverage is an ongoing *curation* task (a lib.d.ts

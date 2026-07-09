@@ -530,6 +530,133 @@ export function makeMachine<D>(
   // `split` → a fresh array of (unknown) strings.
   intrinsicModels.set("String.prototype.split", (ctx) => allocIntrinsicObj(domain.topString(), ctx));
 
+  // --- Phase 3: higher-order Array methods (invoke the callback through the machine) ---
+  // These are NOT synchronous (no entry in `intrinsicModels`): they spawn a real
+  // call to the user callback. Because elements are index-insensitive, the callback
+  // is entered *once* with the smashed element value; the abstract fixpoint covers
+  // every concrete element. Seeded as intrinsic fields on `Array.prototype` below.
+  const HIGHER_ORDER_ARRAY = [
+    "map", "flatMap", "forEach", "filter", "find", "findIndex", "findLast",
+    "some", "every", "reduce", "reduceRight", "sort",
+  ] as const;
+  const higherOrderArray = new Set<string>(HIGHER_ORDER_ARRAY);
+
+  /** Allocate a fresh array with the given elements, threading the store. */
+  function allocArrayWith(
+    elems: D,
+    oaddr: OAddr<Ctx>,
+    store: Store<Ctx, D>,
+  ): { ref: D; store: Store<Ctx, D> } {
+    const obj: AbsObject<Ctx, D> = {
+      shapes: FinSet.of(shapeKey, shapes.fromFields([["length", "num"]])),
+      fields: FinMap.fromEntries<PropName, D>(propK, [["length", domain.anyNum()]]),
+      accessors: FinMap.empty(propK),
+      proto: arrayProtoLink(),
+      elements: elems,
+    };
+    const r = installObj(store.objs, store.counts, oaddr, obj);
+    return { ref: domain.objRef(oaddr), store: { ...store, objs: r.objs, counts: r.counts } };
+  }
+
+  /**
+   * A higher-order Array method (`arr.map(f)`, `arr.reduce(f, init)`, …). Enters the
+   * callback `f` with the receiver's (smashed) element value; the *result* is either
+   * collected from `f`'s return (`map`), threaded (`reduce`), or produced
+   * synchronously while `f` is called for effect (`forEach`/`filter`/…).
+   */
+  function higherOrderBranch(
+    M: AnalysisMonad<Store<Ctx, D>>,
+    method: string,
+    thisVal: D,
+    argVals: ReadonlyArray<D>,
+    callLoc: Loc,
+    name: Name,
+    body: Expr,
+    c: ControlState<Ctx>,
+    store: Store<Ctx, D>,
+  ): Array<Comp<ControlState<Ctx>>> {
+    const element = recvElements(thisVal, store.objs);
+    const idx = domain.anyNum();
+    const undef = domain.lit(litUndef);
+    const cbClos = domain.elimClo(argVals[0] ?? DJ.bot).toArray();
+
+    // `map`/`flatMap`: collect the callback's returns into a fresh result array.
+    if (method === "map" || method === "flatMap") {
+      const raddr: OAddr<Ctx> = { loc: callLoc, time: c.time };
+      const { store: st } = allocArrayWith(DJ.bot, raddr, store);
+      if (cbClos.length === 0) {
+        // Unknown callback: sound fallback — result array of unknown elements.
+        const fb = allocArrayWith(DJ.join(element, undef), raddr, store);
+        return [bindAndContinue(M, name, fb.ref, body, c.env, c.kaddr, c.time, fb.store)];
+      }
+      const frame: Kont<Ctx> = { tag: "frame", name, body, env: c.env, time: c.time, next: c.kaddr, collect: raddr };
+      return cbClos.map((cl) =>
+        enterClosure(M, cl, [element, idx, thisVal], callLoc, callLoc, c.time, st, frame, c.kaddr, null),
+      );
+    }
+
+    // `reduce`/`reduceRight`: acc = init ⊔ element; the callback's return is the result.
+    if (method === "reduce" || method === "reduceRight") {
+      const init = argVals.length > 1 ? argVals[1]! : element;
+      const acc = DJ.join(init, element);
+      if (cbClos.length === 0) return [bindAndContinue(M, name, acc, body, c.env, c.kaddr, c.time, store)];
+      const frame: Kont<Ctx> = { tag: "frame", name, body, env: c.env, time: c.time, next: c.kaddr };
+      return cbClos.map((cl) =>
+        enterClosure(M, cl, [acc, element, idx, thisVal], callLoc, callLoc, c.time, store, frame, c.kaddr, null),
+      );
+    }
+
+    // The rest: a synchronous result, with the callback called purely for effect
+    // (its return discarded). `sort` passes two elements to a comparator.
+    let result: D;
+    let cbArgs: ReadonlyArray<D>;
+    let st = store;
+    switch (method) {
+      case "forEach":
+        result = undef;
+        cbArgs = [element, idx, thisVal];
+        break;
+      case "filter": {
+        const a = allocArrayWith(element, { loc: callLoc, time: c.time }, store);
+        result = a.ref;
+        st = a.store;
+        cbArgs = [element, idx, thisVal];
+        break;
+      }
+      case "find":
+      case "findLast":
+        result = DJ.join(element, undef);
+        cbArgs = [element, idx, thisVal];
+        break;
+      case "findIndex":
+        result = domain.anyNum();
+        cbArgs = [element, idx, thisVal];
+        break;
+      case "some":
+      case "every":
+        result = domain.anyBool();
+        cbArgs = [element, idx, thisVal];
+        break;
+      case "sort":
+        result = thisVal;
+        cbArgs = [element, element];
+        break;
+      default:
+        return [];
+    }
+    // Pre-bind the result to `name`, then run the callback with a discard frame that
+    // continues to `body` (mirrors setter dispatch); or, with no callback, just bind.
+    const addr: Addr<Ctx> = { name, time: c.time };
+    const env2 = c.env.set(name, addr);
+    const st2: Store<Ctx, D> = { ...st, vals: st.vals.joinAt(DJ, addr, result) };
+    if (cbClos.length === 0)
+      return [M.bind(M.put(st2), () => M.unit({ control: body, env: env2, kaddr: c.kaddr, time: c.time }))];
+    const frame: Kont<Ctx> = { tag: "frame", name: "%discard", body, env: env2, time: c.time, next: c.kaddr };
+    return cbClos.map((cl) =>
+      enterClosure(M, cl, cbArgs, callLoc, callLoc, c.time, st2, frame, c.kaddr, null),
+    );
+  }
+
   /** Numeric constants exposed as data properties on the namespace objects. */
   const MATH_CONSTS: Record<string, number> = {
     PI: Math.PI, E: Math.E, LN2: Math.LN2, LN10: Math.LN10,
@@ -595,9 +722,12 @@ export function makeMachine<D>(
       vals = vals.joinAt(DJ, addr, v);
     };
 
-    // Prototype objects backing the array/string methods (Phase 2), at their fixed
-    // synthetic addresses so freshly-allocated arrays can proto-link to them.
-    objs = objs.set(ARRAY_PROTO_ADDR, mkObj(methodsOf("Array.prototype")));
+    // Prototype objects backing the array/string methods (Phase 2/3), at their fixed
+    // synthetic addresses so freshly-allocated arrays can proto-link to them. The
+    // higher-order array methods (Phase 3) are added as intrinsic fields even though
+    // they have no synchronous `intrinsicModels` entry — the dispatch routes them.
+    const hoArrayFields = HIGHER_ORDER_ARRAY.map((m) => [m, intr(`Array.prototype.${m}`)] as const);
+    objs = objs.set(ARRAY_PROTO_ADDR, mkObj([...methodsOf("Array.prototype"), ...hoArrayFields]));
     objs = objs.set(STRING_PROTO_ADDR, mkObj(methodsOf("String.prototype")));
     const protoField = (a: OAddr<Ctx>): readonly [string, D] => ["prototype", domain.objRef(a)];
 
@@ -919,17 +1049,26 @@ export function makeMachine<D>(
               M,
               konts.toArray().map((k): Comp<ControlState<Ctx>> => {
                 if (k.tag === "halt") return M.mzero(); // final state: no successor
-                // For a `new` frame the result is the returned value when it is an
-                // object, otherwise the freshly-constructed `this` object.
-                const resultVal =
-                  k.newObj && domain.elimObj(v).isEmpty() ? domain.objRef(k.newObj) : v;
+                // A `collect` frame (`Array.map`) weak-adds the callback's return to
+                // the result array's elements and binds *that array* to `name`.
+                let objs = store.objs;
+                let resultVal: D;
+                if (k.collect) {
+                  const arr = objs.getOr(k.collect, objLat.bot);
+                  objs = objs.set(k.collect, { ...arr, elements: DJ.join(arr.elements, v) });
+                  resultVal = domain.objRef(k.collect);
+                } else {
+                  // For a `new` frame the result is the returned value when it is an
+                  // object, otherwise the freshly-constructed `this` object.
+                  resultVal = k.newObj && domain.elimObj(v).isEmpty() ? domain.objRef(k.newObj) : v;
+                }
                 // Restore the caller's time captured in the frame, and bind the
                 // returned value in the caller's context (not the callee's).
                 const bound = bindVar(k.env, store.vals, k.name, resultVal, k.time);
                 const store2: Store<Ctx, D> = {
                   vals: bound.vals,
                   konts: store.konts,
-                  objs: store.objs,
+                  objs,
                   counts: store.counts,
                 };
                 const successor: ControlState<Ctx> = {
@@ -1185,6 +1324,14 @@ export function makeMachine<D>(
                 // array methods can weak-update its `elements` bucket.
                 if (intrinsics)
                   for (const id of domain.elimIntrinsic(methodVal)) {
+                    // Higher-order array methods (Phase 3) spawn a real callback call.
+                    if (id.startsWith("Array.prototype.")) {
+                      const m = id.slice("Array.prototype.".length);
+                      if (higherOrderArray.has(m)) {
+                        branches.push(...higherOrderBranch(M, m, thisVal, argVals, r.loc, e.name, e.body, c, store));
+                        continue;
+                      }
+                    }
                     const model = intrinsicModels.get(id);
                     if (!model) continue;
                     const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };

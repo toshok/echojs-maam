@@ -46,6 +46,37 @@ test("Number(x) coerces to number while Number.isInteger reads the statics objec
   assert.equal(spec.bools.isEmpty(), false);
 });
 
+// --- Phase 2: array/string prototype methods ---
+
+test("array push returns a numeric length and slice returns a fresh array", () => {
+  assert.equal(hasNum(val(`var a = [1, 2]; a.push(3);`)), true);
+  const sliced = val(`var a = [1, 2, 3]; a.slice(1);`);
+  assert.equal(sliced.objs.isEmpty(), false); // a new array object
+});
+
+test("array push mutates the receiver's elements (read back through an index)", () => {
+  // The heap effect: `push` writes into the shared elements bucket, so `a[0]` sees it.
+  assert.equal(hasStr(val(`var a = []; a.push("hi"); a[0];`)), true);
+});
+
+test("array indexOf → number, join → string, includes → boolean", () => {
+  assert.equal(hasNum(val(`[1, 2].indexOf(2);`)), true);
+  assert.equal(hasStr(val(`[1, 2].join(",");`)), true);
+  assert.equal(val(`[1, 2].includes(2);`).bools.isEmpty(), false);
+});
+
+test("string methods dispatch on primitive receivers", () => {
+  assert.equal(hasNum(val(`"abc".charCodeAt(0);`)), true);
+  assert.equal(hasStr(val(`"hello".slice(1);`)), true);
+  assert.equal(val(`"ab".startsWith("a");`).bools.isEmpty(), false);
+  assert.equal(val(`"a,b".split(",");`).objs.isEmpty(), false); // a fresh array
+});
+
+test("array methods are unmodeled without the knob (degrade)", () => {
+  // `[].push(...)` has no modeled prototype ⇒ result is not a precise number.
+  assert.equal(hasNum(val(`var a = [1]; a.push(2);`, off)), false);
+});
+
 test("without the knob, the same globals degrade (unmodeled)", () => {
   // `Math` is unbound ⇒ Math.floor(...) degrades; the result is not a precise num.
   const v = val(`Math.floor(3.7);`, off);

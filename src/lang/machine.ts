@@ -175,6 +175,16 @@ export function makeMachine<D>(
   /** The canonical prototype-object address for a function (lambda) location — a singleton. */
   const protoAddr = (lambdaLoc: Loc): OAddr<Ctx> => ({ loc: lambdaLoc, time: time.tzero, proto: true });
 
+  // Synthetic singleton addresses for the seeded standard-library objects (only
+  // populated when `intrinsics` is on). Negative locs never collide with program
+  // locs. `Array.prototype`/`String.prototype` back the array/string methods (§Phase 2).
+  const ARRAY_PROTO_ADDR: OAddr<Ctx> = { loc: -110, time: time.tzero };
+  const STRING_PROTO_ADDR: OAddr<Ctx> = { loc: -111, time: time.tzero };
+  /** The prototype link a freshly-allocated array carries — `Array.prototype` when
+   * intrinsics are modeled (so `arr.push`/`arr.slice` resolve), else empty. */
+  const arrayProtoLink = (): FinSet<OAddr<Ctx>> =>
+    intrinsics ? FinSet.of(oak, ARRAY_PROTO_ADDR) : FinSet.empty(oak);
+
   /** Accessor dispatch: property-access-site loc → the getter/setter functions it resolves to. */
   const accessorGetSites = new Map<Loc, Set<Loc>>();
   const accessorSetSites = new Map<Loc, Set<Loc>>();
@@ -367,42 +377,66 @@ export function makeMachine<D>(
     objs: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>;
     counts: FinMap<OAddr<Ctx>, ACount>;
   };
-  type IntrinsicFn = (
-    args: ReadonlyArray<D>,
-    oaddr: OAddr<Ctx>, // allocation site `(call loc, current time)`, for constructors
-    objs: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>,
-    counts: FinMap<OAddr<Ctx>, ACount>,
-  ) => IntrinsicEffect;
+  /**
+   * The context a modeled intrinsic is applied in: its argument values, the
+   * *receiver* value (`⊥` for statics/bare functions; the array/string for
+   * prototype methods), a fresh allocation site for constructors/result arrays,
+   * and the current heap + counts (for reads and mutations).
+   */
+  type IntrinsicCtx = {
+    args: ReadonlyArray<D>;
+    recv: D;
+    oaddr: OAddr<Ctx>;
+    objs: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>;
+    counts: FinMap<OAddr<Ctx>, ACount>;
+  };
+  type IntrinsicFn = (ctx: IntrinsicCtx) => IntrinsicEffect;
 
-  const pure = (make: () => D): IntrinsicFn => (_a, _o, objs, counts) => ({ value: make(), objs, counts });
+  const pure = (make: () => D): IntrinsicFn => (ctx) => ({ value: make(), objs: ctx.objs, counts: ctx.counts });
   const NUM = pure(() => domain.anyNum());
   const BOOLN = pure(() => domain.anyBool());
   const STRN = pure(() => domain.topString());
-
-  /** Allocate a fresh object (empty, or array-shaped) at the call site, honoring counting. */
-  function allocIntrinsicObj(
-    array: boolean,
-    oaddr: OAddr<Ctx>,
+  const joinArgs = (args: ReadonlyArray<D>): D => args.reduce((acc, a) => DJ.join(acc, a), DJ.bot);
+  /** The join of the `elements` buckets of every object `recv` may point to. */
+  const recvElements = (recv: D, objs: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>): D => {
+    let e = DJ.bot;
+    for (const a of domain.elimObj(recv)) e = DJ.join(e, objs.getOr(a, objLat.bot).elements);
+    return e;
+  };
+  /** Weak-add `add` into the `elements` bucket of every object `recv` may point to. */
+  const pushElements = (
+    recv: D,
+    add: D,
     objs: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>,
-    counts: FinMap<OAddr<Ctx>, ACount>,
-  ): IntrinsicEffect {
-    const obj: AbsObject<Ctx, D> = array
-      ? {
-          shapes: FinSet.of(shapeKey, shapes.fromFields([["length", "num"]])),
-          fields: FinMap.fromEntries<PropName, D>(propK, [["length", domain.anyNum()]]),
-          accessors: FinMap.empty(propK),
-          proto: FinSet.empty(oak),
-          elements: DJ.bot, // holes read as `undefined` via getDyn; fills accumulate on write
-        }
-      : {
-          shapes: FinSet.of(shapeKey, shapes.empty()),
-          fields: FinMap.empty(propK),
-          accessors: FinMap.empty(propK),
-          proto: FinSet.empty(oak),
-          elements: DJ.bot,
-        };
-    const r = installObj(objs, counts, oaddr, obj);
-    return { value: domain.objRef(oaddr), objs: r.objs, counts: r.counts };
+  ): FinMap<OAddr<Ctx>, AbsObject<Ctx, D>> => {
+    let out = objs;
+    for (const a of domain.elimObj(recv)) {
+      const o = out.getOr(a, objLat.bot);
+      out = out.set(a, { ...o, elements: DJ.join(o.elements, add) });
+    }
+    return out;
+  };
+
+  /** Allocate a fresh array (given elements) or plain object at the call site. */
+  function allocIntrinsicObj(array: D | null, ctx: IntrinsicCtx): IntrinsicEffect {
+    const obj: AbsObject<Ctx, D> =
+      array !== null
+        ? {
+            shapes: FinSet.of(shapeKey, shapes.fromFields([["length", "num"]])),
+            fields: FinMap.fromEntries<PropName, D>(propK, [["length", domain.anyNum()]]),
+            accessors: FinMap.empty(propK),
+            proto: arrayProtoLink(),
+            elements: array, // holes read as `undefined` via getDyn; fills accumulate on write
+          }
+        : {
+            shapes: FinSet.of(shapeKey, shapes.empty()),
+            fields: FinMap.empty(propK),
+            accessors: FinMap.empty(propK),
+            proto: FinSet.empty(oak),
+            elements: DJ.bot,
+          };
+    const r = installObj(ctx.objs, ctx.counts, ctx.oaddr, obj);
+    return { value: domain.objRef(ctx.oaddr), objs: r.objs, counts: r.counts };
   }
 
   /** id → summary transfer function. Extend this table to widen library coverage. */
@@ -410,6 +444,7 @@ export function makeMachine<D>(
   const registerAll = (ids: ReadonlyArray<string>, fn: IntrinsicFn): void => {
     for (const id of ids) intrinsicModels.set(id, fn);
   };
+  // --- Phase 1: pure statics + constructors ---
   // Number-returning pure statics.
   registerAll(
     [
@@ -434,8 +469,66 @@ export function makeMachine<D>(
   // String-returning pure statics.
   registerAll(["String", "String.fromCharCode", "String.fromCodePoint"], STRN);
   // Allocating constructors (`Array(n)` / `new Array(n)`, `Object()` / `new Object()`).
-  intrinsicModels.set("Array", (_a, oaddr, objs, counts) => allocIntrinsicObj(true, oaddr, objs, counts));
-  intrinsicModels.set("Object", (_a, oaddr, objs, counts) => allocIntrinsicObj(false, oaddr, objs, counts));
+  intrinsicModels.set("Array", (ctx) => allocIntrinsicObj(DJ.bot, ctx));
+  intrinsicModels.set("Object", (ctx) => allocIntrinsicObj(null, ctx));
+
+  // --- Phase 2: Array.prototype methods (heap effects on the receiver's elements) ---
+  // Mutating: append args to the shared elements bucket; return the new length (num).
+  registerAll(["Array.prototype.push", "Array.prototype.unshift"], (ctx) => ({
+    value: domain.anyNum(),
+    objs: pushElements(ctx.recv, joinArgs(ctx.args), ctx.objs),
+    counts: ctx.counts,
+  }));
+  // Removing: return an element (or `undefined`); we do not shrink `length` precisely.
+  registerAll(["Array.prototype.pop", "Array.prototype.shift"], (ctx) => ({
+    value: DJ.join(recvElements(ctx.recv, ctx.objs), domain.lit(litUndef)),
+    objs: ctx.objs,
+    counts: ctx.counts,
+  }));
+  // Copying: a fresh array whose elements ⊔ the receiver's (and, for concat, the args').
+  registerAll(["Array.prototype.slice", "Array.prototype.concat", "Array.prototype.flat"], (ctx) => {
+    let elems = recvElements(ctx.recv, ctx.objs);
+    for (const a of ctx.args) elems = DJ.join(elems, DJ.join(a, recvElements(a, ctx.objs)));
+    return allocIntrinsicObj(elems, ctx);
+  });
+  // In-place, returns the receiver. `sort`'s comparator (if any) is ignored soundly
+  // for the ordering (elements are index-insensitive); it is *not* invoked (Phase 3).
+  registerAll(["Array.prototype.reverse", "Array.prototype.sort"], (ctx) => ({
+    value: ctx.recv,
+    objs: ctx.objs,
+    counts: ctx.counts,
+  }));
+  intrinsicModels.set("Array.prototype.fill", (ctx) => ({
+    value: ctx.recv,
+    objs: pushElements(ctx.recv, joinArgs(ctx.args), ctx.objs),
+    counts: ctx.counts,
+  }));
+  registerAll(["Array.prototype.indexOf", "Array.prototype.lastIndexOf"], NUM);
+  registerAll(["Array.prototype.includes"], BOOLN);
+  registerAll(["Array.prototype.join", "Array.prototype.toString"], STRN);
+
+  // --- Phase 2: String.prototype methods (immutable receiver — no heap effect) ---
+  registerAll(
+    [
+      "String.prototype.charCodeAt", "String.prototype.codePointAt", "String.prototype.indexOf",
+      "String.prototype.lastIndexOf", "String.prototype.search", "String.prototype.localeCompare",
+    ],
+    NUM,
+  );
+  registerAll(
+    [
+      "String.prototype.charAt", "String.prototype.slice", "String.prototype.substring",
+      "String.prototype.substr", "String.prototype.toUpperCase", "String.prototype.toLowerCase",
+      "String.prototype.trim", "String.prototype.trimStart", "String.prototype.trimEnd",
+      "String.prototype.replace", "String.prototype.replaceAll", "String.prototype.concat",
+      "String.prototype.repeat", "String.prototype.padStart", "String.prototype.padEnd",
+      "String.prototype.normalize", "String.prototype.toString", "String.prototype.at",
+    ],
+    STRN,
+  );
+  registerAll(["String.prototype.includes", "String.prototype.startsWith", "String.prototype.endsWith"], BOOLN);
+  // `split` → a fresh array of (unknown) strings.
+  intrinsicModels.set("String.prototype.split", (ctx) => allocIntrinsicObj(domain.topString(), ctx));
 
   /** Numeric constants exposed as data properties on the namespace objects. */
   const MATH_CONSTS: Record<string, number> = {
@@ -466,20 +559,23 @@ export function makeMachine<D>(
     let objs = objs0;
     const intr = (id: string): D => domain.intrinsic(id);
     const numC = (n: number): D => domain.lit(litNum(n));
-    /** Model ids under `prefix.` become that namespace's method fields (`floor`, …). */
+    /** Model ids under `prefix.` become that namespace's method fields (`floor`, …).
+     * Only the *immediate* segment matches, so `methodsOf("Array")` is `isArray` and
+     * excludes the nested `Array.prototype.*`. */
     const methodsOf = (prefix: string): Array<readonly [string, D]> =>
       [...intrinsicModels.keys()]
-        .filter((k) => k.startsWith(`${prefix}.`))
+        .filter((k) => k.startsWith(`${prefix}.`) && !k.slice(prefix.length + 1).includes("."))
         .map((k) => [k.slice(prefix.length + 1), intr(k)] as const);
+    // The seeded library objects are read-only scaffolding — a compiler never lays
+    // out `Math`. Give them the megamorphic (⊤) shape so building them does not
+    // intern a chain of intermediate shapes (which would otherwise inflate the
+    // shape metric by a fixed ~100). Field *values* are still exact, so reads of
+    // `Math.PI` / `arr.push` resolve precisely; only the *shape* is coarsened.
     const mkObj = (fields: ReadonlyArray<readonly [string, D]>): AbsObject<Ctx, D> => {
       let fmap = FinMap.empty<PropName, D>(propK);
-      const typed: Array<readonly [PropName, string]> = [];
-      for (const [k, v] of fields) {
-        fmap = fmap.set(k, v);
-        typed.push([k, domain.typeSig(v)]);
-      }
+      for (const [k, v] of fields) fmap = fmap.set(k, v);
       return {
-        shapes: FinSet.of(shapeKey, shapes.fromFields(typed)),
+        shapes: FinSet.of(shapeKey, shapes.top()),
         fields: fmap,
         accessors: FinMap.empty(propK),
         proto: FinSet.empty(oak),
@@ -499,10 +595,16 @@ export function makeMachine<D>(
       vals = vals.joinAt(DJ, addr, v);
     };
 
+    // Prototype objects backing the array/string methods (Phase 2), at their fixed
+    // synthetic addresses so freshly-allocated arrays can proto-link to them.
+    objs = objs.set(ARRAY_PROTO_ADDR, mkObj(methodsOf("Array.prototype")));
+    objs = objs.set(STRING_PROTO_ADDR, mkObj(methodsOf("String.prototype")));
+    const protoField = (a: OAddr<Ctx>): readonly [string, D] => ["prototype", domain.objRef(a)];
+
     const mathA = at(-101, mkObj([...methodsOf("Math"), ...consts(MATH_CONSTS)]));
     const numberA = at(-102, mkObj([...methodsOf("Number"), ...consts(NUMBER_CONSTS)]));
-    const stringA = at(-103, mkObj(methodsOf("String")));
-    const arrayA = at(-104, mkObj(methodsOf("Array")));
+    const stringA = at(-103, mkObj([...methodsOf("String"), protoField(STRING_PROTO_ADDR)]));
+    const arrayA = at(-104, mkObj([...methodsOf("Array"), protoField(ARRAY_PROTO_ADDR)]));
     const objectA = at(-105, mkObj([]));
 
     bind("Math", domain.objRef(mathA));
@@ -925,7 +1027,7 @@ export function makeMachine<D>(
                     shapes: FinSet.of(shapeKey, shapes.fromFields([["length", domain.typeSig(len)]])),
                     fields: FinMap.fromEntries<PropName, D>(propK, [["length", len]]),
                     accessors: FinMap.empty(propK),
-                    proto: FinSet.empty(oak),
+                    proto: arrayProtoLink(), // link to `Array.prototype` so `.push`/`.slice` resolve
                     elements: elems,
                   }));
                   v = domain.objRef(oaddr);
@@ -1077,16 +1179,29 @@ export function makeMachine<D>(
                     enterClosure(M, clo, argVals, r.loc, ctxLoc, c.time, store, baseFrame, c.kaddr, thisVal),
                   );
                 }
-                // A modeled intrinsic method (`Math.floor`, `String.fromCharCode`,
-                // `Number.isInteger`): dispatch its summary synchronously.
+                // A modeled intrinsic method resolved through the prototype chain
+                // (`Math.floor` on the namespace object, `arr.push` on `Array.prototype`):
+                // dispatch its summary synchronously, passing the receiver so mutating
+                // array methods can weak-update its `elements` bucket.
                 if (intrinsics)
                   for (const id of domain.elimIntrinsic(methodVal)) {
                     const model = intrinsicModels.get(id);
                     if (!model) continue;
                     const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
-                    const eff = model(argVals, oaddr, store.objs, store.counts);
+                    const eff = model({ args: argVals, recv: thisVal, oaddr, objs: store.objs, counts: store.counts });
                     branches.push(degrade(eff.value, { ...store, objs: eff.objs, counts: eff.counts }));
                   }
+              }
+              // String primitives have no object address to walk, so their prototype
+              // methods (`s.charCodeAt`, `s.slice`) are dispatched directly when the
+              // receiver may be a string and the key names a modeled method.
+              if (intrinsics && domain.typeSig(objVal).split("|").includes("str")) {
+                const model = intrinsicModels.get(`String.prototype.${r.key}`);
+                if (model) {
+                  const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
+                  const eff = model({ args: argVals, recv: objVal, oaddr, objs: store.objs, counts: store.counts });
+                  branches.push(degrade(eff.value, { ...store, objs: eff.objs, counts: eff.counts }));
+                }
               }
               // No resolvable method (receiver isn't a tracked object, or the
               // property holds no closure) ⇒ degrade rather than abort.
@@ -1105,7 +1220,7 @@ export function makeMachine<D>(
                 const model = intrinsicModels.get(id);
                 if (!model) continue;
                 const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
-                const eff = model(argVals, oaddr, store.objs, store.counts);
+                const eff = model({ args: argVals, recv: DJ.bot, oaddr, objs: store.objs, counts: store.counts });
                 intrBranches.push(degrade(eff.value, { ...store, objs: eff.objs, counts: eff.counts }));
               }
             }

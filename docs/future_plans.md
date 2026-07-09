@@ -69,12 +69,20 @@ rise (degraded-`undefined` was *collapsing* shapes; real types differentiate). M
 verdicts and time unchanged. A precision/soundness win (removes the §6.5 degradation
 threat), a size tradeoff — worth it for codegen sharpness.
 
-### Phase 2 — array/string prototype methods with heap effects (MEDIUM, TODO)
-`arr.push`/`pop`/`slice`/`concat`/`indexOf`/`join`, `str.charCodeAt`/`charAt`/`slice`/
-`split`/`toUpperCase`. Value-returning ones are easy; the mutating ones (`push`,
-`splice`, `sort`) need a sound heap effect (weak-update the receiver's elements
-bucket). These are *method calls on values*, so they dispatch on the receiver's
-shape, not a namespace object — the model needs the receiver.
+### Phase 2 — array/string prototype methods with heap effects — DONE (2026-07)
+`Array.prototype` and `String.prototype` seeded as store objects (megamorphic ⊤
+shape, so they add no shapes to the metric); arrays proto-link to `Array.prototype`
+so `arr.push`/`.slice` resolve through the normal prototype walk. Intrinsic models
+now receive the **receiver**, so mutating methods (`push`/`unshift`/`fill`) weak-
+update its `elements` bucket (verified: `a.push("hi"); a[0]` reads `str`). Covered:
+array `push`/`pop`/`shift`/`unshift`/`slice`/`concat`/`fill`/`reverse`/`sort`/
+`indexOf`/`includes`/`join`; string `charCodeAt`/`charAt`/`slice`/`substring`/
+`split`/`toUpperCase`/`includes`/`startsWith`/… (string primitives dispatch via a
+`typeSig`-includes-`str` check, since they have no object address to walk).
+**Results:** `unknownCalls` fall further (navier 9→3, deltablue 9→7, richards 5→3);
+shapes essentially unchanged for most (richards +72 real precision); states and
+monomorphism unchanged. +5 tests (185 total). `sort`/`replace` callbacks are *not*
+invoked (returned soundly, ignoring the fn) — that is Phase 3.
 
 ### Phase 3 — higher-order builtins (HARD, TODO)
 `map`/`forEach`/`filter`/`reduce`/`some`/`every`/`sort(cmp)` must *invoke the user

@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/**/*.ts"],
+  "//": "parse.ts is an acorn-based convenience for tests/demos only; keep it (and acorn) out of the shipped build.",
+  "exclude": ["src/lang/parse.ts"]
+}

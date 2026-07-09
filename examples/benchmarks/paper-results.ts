@@ -1,9 +1,9 @@
 /**
  * Regenerate **every results table in `docs/paper-draft.md`** in one invocation.
  *
- *   npx tsx examples/benchmarks/paper-results.ts            # all tables (~10 min)
+ *   npx tsx examples/benchmarks/paper-results.ts            # all 6 tables (~15 min)
  *   PAPER_ONLY=fast npx tsx examples/benchmarks/paper-results.ts   # skip crypto+box2d (<1 min)
- *   PAPER_ONLY=1,2  npx tsx examples/benchmarks/paper-results.ts   # only tables 1 and 2
+ *   PAPER_ONLY=1,6  npx tsx examples/benchmarks/paper-results.ts   # only tables 1 and 6
  *
  * Output is Markdown, ready to paste back into the draft, preceded by a machine-spec
  * block for the `⟨MACHINE SPEC⟩` placeholder (§6 setup).
@@ -49,6 +49,7 @@ interface Job {
   readonly push: boolean; // P4F pushdown
   readonly st: number; // stateCap
   readonly cnt: boolean; // abstract counting
+  readonly intr: boolean; // standard-library intrinsics
 }
 
 interface Result {
@@ -59,10 +60,11 @@ interface Result {
   specsMono: number;
   ctors: number;
   ctorsMono: number;
+  unknownCalls: number;
 }
 
 const jobKey = (j: Job): string =>
-  `${j.bench || `src:${j.src}`}|sc${j.sc}|r${+j.rec}|g${+j.gc}|p${+j.push}|st${j.st}|c${+j.cnt}`;
+  `${j.bench || `src:${j.src}`}|sc${j.sc}|r${+j.rec}|g${+j.gc}|p${+j.push}|st${j.st}|c${+j.cnt}|i${+j.intr}`;
 
 // --- child mode: run ONE job in-process, print one RESULT line -----------------
 
@@ -70,7 +72,7 @@ function runOne(j: Job): Result {
   const prog = j.src ?? `${readFileSync(join(HERE, `${j.bench}.js`), "utf8")}\n;(function(){${DRIVERS[j.bench]}})();\n`;
   const ast = parse(prog);
   const t = Date.now();
-  const r = analyze(ast, kCFA(0, "flow-sensitive", "call-site", j.sc, j.rec, j.gc, j.push, j.st, j.cnt));
+  const r = analyze(ast, kCFA(0, "flow-sensitive", "call-site", j.sc, j.rec, j.gc, j.push, j.st, j.cnt, j.intr));
   const ms = Date.now() - t;
   const specs = r.specializations();
   const ctors = r.constructors();
@@ -82,6 +84,7 @@ function runOne(j: Job): Result {
     specsMono: specs.filter((s) => s.monomorphic).length,
     ctors: ctors.length,
     ctorsMono: ctors.filter((c) => c.monomorphic).length,
+    unknownCalls: r.metrics.unknownCalls,
   };
 }
 
@@ -139,6 +142,7 @@ const job = (bench: string, o: Partial<Job> = {}): Job => ({
   push: false,
   st: 0,
   cnt: false,
+  intr: false,
   ...o,
 });
 
@@ -272,6 +276,36 @@ if (wanted(5)) {
     const off = measure(job(name, { ...extra, push: false }));
     const on = measure(job(name, { ...extra, push: true }));
     P(`| ${name} | ${cell(off)} | ${cell(on)} |`);
+  }
+  P();
+}
+
+// === Table 6 — §6.3 standard-library intrinsics ablation =======================
+if (wanted(6)) {
+  P("### §6.3 — Standard-library intrinsics ablation (off → on)");
+  P();
+  P("| benchmark | unknownCalls | shapes | states | time | specs (mono) |");
+  P("|-----------|--------------|--------|--------|------|--------------|");
+  const arrow = <T>(a: T, b: T): string => (a === b ? `${a}` : `${a} → ${b}`);
+  // crypto needs the state cap to converge; the rest run uncapped (matches the draft).
+  const rows: Array<[string, Partial<Job>]> = [
+    ["richards", {}],
+    ["deltablue", {}],
+    ["navier-stokes", {}],
+    ["crypto", { st: 1 }],
+  ];
+  for (const [name, extra] of rows) {
+    const off = measure(job(name, { ...extra, intr: false }));
+    const on = measure(job(name, { ...extra, intr: true }));
+    if (!off || !on) {
+      P(`| ${name} | ${dnc("")} |||||`);
+      continue;
+    }
+    P(
+      `| ${name} | ${arrow(off.unknownCalls, on.unknownCalls)} | ${arrow(off.shapes, on.shapes)} | ` +
+        `${arrow(off.states, on.states)} | ${arrow(secs(off.ms), secs(on.ms))} | ` +
+        `${arrow(mono(off, "spec"), mono(on, "spec"))} |`,
+    );
   }
   P();
 }

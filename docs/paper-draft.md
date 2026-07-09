@@ -98,10 +98,78 @@ sites an AOT compiler must handle dynamically.
   (§3.3).
 - A totality guarantee via an adaptive context cap bounding the state space to
   `locations × (cap + 1)`, terminating on any input (§5).
+- A value-level model of the JavaScript standard library — statics, prototype
+  methods with heap effects, and higher-order methods that enter the user callback
+  through the machine — that tightens the soundness envelope (removing the
+  degradation over-approximation) and, in doing so, makes callbacks reachable only
+  through `map`/`reduce` analyzable and hence compilable (§4.7).
 - An empirical study over Octane establishing near-total function-level
   monomorphism that survives coarsening, with per-technique ablations — including a
   negative result for abstract counting that exposes a `k = 0` strong-update
   ceiling (§6).
+
+### A worked example: from analysis to a compiled loop
+
+> *(This is intended as a standalone "Overview" section (§2) in the final draft;
+> subsequent sections renumber. Kept in §1 here to avoid churn.)*
+
+Consider three lines of ordinary JavaScript:
+
+```js
+function scale(x) { return x * 100; }
+const out = [1, 2, 3].map(scale);
+out[0];
+```
+
+Nothing in this program calls `scale` directly. To a control-flow analysis that
+does not model `Array.prototype.map`, the call `[1,2,3].map(scale)` is a call to an
+unknown callee: it degrades to an unknown result, `scale` is *never entered*, and
+`out` is an unknown value. `scale` is, to the analysis, dead code — and therefore
+to an ahead-of-time compiler it is a function with *no type information at all*.
+This is the state of our analyzer with intrinsic modeling off, and we have measured
+exactly it: `scale` does not appear in the specialization report, and `out[0]`
+reads as ⊥/degraded.
+
+With the standard library modeled (§4.7), `map` is a known operation whose semantics
+the analyzer executes: it enters the callback with the array's (abstract) element
+value and collects the callback's return into a fresh result array. The same three
+lines now yield four facts, each a precondition a compiler needs:
+
+1. **The callee is known.** `map` resolved to a modeled intrinsic, not an unknown
+   call, so the compiler may lower `map` *itself* to a loop rather than a call.
+2. **The callback resolves to a single closure** (`scale`) — one body to inline, no
+   dispatch.
+3. **The callback is type-monomorphic**, reported as `scale : (num) → num` — the
+   inlined body needs no argument guard.
+4. **Element and result types are known** — `num[]` in, `num[]` out — so both the
+   read and the freshly-allocated result array are unboxed.
+
+Composing the four, the source compiles to a monomorphic, unboxed loop with the
+callback spliced in — no closure allocation, no dynamic dispatch, no boxing, no
+deoptimization guard:
+
+```
+out : num[len]
+for i in 0 .. len-1:
+    out[i] = in[i] * 100        // scale inlined; num throughout
+```
+
+This is the callback-inlining a just-in-time compiler performs *speculatively*,
+recovering from a wrong guess by deoptimizing. Our analyzer establishes the same
+preconditions *statically and soundly*: monomorphism is a proven property of the
+whole program, not a runtime observation that may be invalidated, so the AOT
+compiler emits the specialized loop with no fallback path.
+
+Two points of the paper are visible in this one example. First, the analyzer's
+*index-insensitivity is aligned with the transform, not a limitation of it*: the
+callback is entered **once** with the smashed element value precisely because
+inlining wants a single body valid for every element; per-element analysis would be
+wasted work. Second, the monomorphism verdict *is* the compiler's decision procedure
+— one target and one type row means "inline, unguarded"; had the array been
+`num | str`, the analyzer would report `(num | str) → …` and hand the compiler the
+exact reason it needs a guard or a second specialization. The rest of the paper is
+about making analyses like this one *total* (so no program is un-analyzable, §5) and
+about *measuring* how often real code is this monomorphic (§6).
 
 ---
 
@@ -333,6 +401,41 @@ distinct shapes at an address exceeds a threshold, its shape set is widened to t
 megamorphic ⊤-shape. This bounds heap memory and is, together with the state cap,
 what the most allocation-intensive benchmark (box2d) requires to converge.
 
+### 4.7 Standard-library intrinsics (`intrinsics`)
+
+The knobs above tune *precision*; this one tunes the *soundness envelope's tightness*.
+A whole-program analysis of real JavaScript inevitably calls into the standard
+library — `Math.floor`, `new Array(n)`, `str.charCodeAt`, `arr.map(f)`. With the
+library unmodeled, such a call resolves to no closure and must be *degraded*: its
+result is taken to be unknown (⊤) and the path continues. Degradation is sound but
+lossy, and — as §6.2 notes — can only *inflate* apparent polymorphism, since ⊤
+flowing out of a library call is maximally imprecise.
+
+We model the library at the value level. The initial store is seeded with the
+globals as *intrinsic* values carrying summary transfer functions; a call whose
+callee is an intrinsic dispatches to its summary rather than degrading. The model
+composes with the object machinery rather than special-casing syntax: `Math` is an
+ordinary object whose fields are intrinsic functions (so `var f = Math.floor; f(x)`
+works via the normal property read); `Array.prototype` is a real object that
+freshly-allocated arrays link to (so `arr.push` resolves through the prototype
+walk); and mutating methods (`push`) apply a heap effect on the receiver's elements.
+Three tiers of coverage, in increasing difficulty: (1) pure statics and constructors
+(`Math.*`, `parseInt`, `new Array`); (2) prototype methods with heap effects
+(`push`/`slice`/`charCodeAt`); (3) higher-order methods (`map`/`forEach`/`reduce`),
+which *enter the user callback through the machine* — the case the §1 worked example
+turns on. Because array elements are index-insensitive, a higher-order callback is
+entered once with the smashed element value, so modeling it adds no state explosion
+(measured: nested `map`s stay bounded; benchmarks without higher-order calls are
+byte-identical on/off).
+
+The effect is a precision/soundness win rather than a cost control: it removes the
+degradation over-approximation (tightening the monomorphism result of §6.2), and it
+*discovers* code that degradation hid — a function used only as a `map` callback goes
+from unanalyzed to fully specialized `(num) → num` (§1). Its shape-space effect is
+two-sided and workload-dependent (§6.3): on array-by-index code (crypto) it removes
+⊤-pollution and *reduces* shapes; on `Math`-heavy code it *differentiates* previously
+collapsed `undefined` results into real typed shapes.
+
 ---
 
 ## 5. Totality
@@ -560,6 +663,34 @@ paper's theme — added precision that the workload does not need is not free �
 reason pushdown is *off* in the recommended configuration. It remains available for
 programs (e.g. heavily higher-order or CPS-style code) where return smearing does
 cascade; we simply do not observe that regime in Octane.
+
+**Standard-library intrinsics (§4.7).** Modeling the library reduces the number of
+call sites that must be degraded (`unknownCalls`) across the board — the metric that
+most directly measures where the analysis, and hence a compiler, must give up:
+
+| benchmark | unknownCalls (off → on) | shapes (off → on) |
+|-----------|-------------------------|-------------------|
+| crypto    | 19 → **8**              | 7204 → **5179**   |
+| navier-stokes | 9 → **3**           | 257 → 257         |
+| richards  | 5 → **3**               | 993 → 1065        |
+| deltablue | 9 → **7**               | 192 → 192         |
+
+Monomorphism is preserved throughout (e.g. crypto stays 232/232), and on crypto the
+analysis is also *faster* (249 → 190 s) because sharper value types cut spurious
+exploration. The shape-space effect is two-sided and diagnostic of *why* a program
+was imprecise: crypto's arrays (used by index) shed the ⊤-pollution that unmodeled
+`new Array` injected (−28%), whereas `Math`-heavy code (richards) sees a small
+*increase* — degradation had collapsed `Math` results to a single `undefined`, and
+real `num` typing correctly differentiates them. Neither changes the state count.
+
+The sharpest effect is not in these totals but in *coverage*, and it is the §1
+example measured: a function reachable only as a higher-order callback is, with the
+library unmodeled, never entered — absent from the analysis and thus uncompilable;
+with modeling on it is entered and reported as a monomorphic `(num) → num`
+specialization. Octane predates functional-style JavaScript and exercises this
+little (its higher-order calls are on unrun jQuery source), so the coverage gain is
+demonstrated on constructed inputs rather than suite totals; we expect it to dominate
+on modern code.
 
 ### 6.4 Baseline comparison
 

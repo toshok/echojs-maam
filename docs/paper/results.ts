@@ -1,9 +1,9 @@
 /**
  * Regenerate **every results table in `docs/paper-draft.md`** in one invocation.
  *
- *   npx tsx examples/benchmarks/paper-results.ts            # all 6 tables (~15 min)
- *   PAPER_ONLY=fast npx tsx examples/benchmarks/paper-results.ts   # skip crypto+box2d (<1 min)
- *   PAPER_ONLY=1,6  npx tsx examples/benchmarks/paper-results.ts   # only tables 1 and 6
+ *   npx tsx docs/paper/results.ts            # all 6 tables (~15 min)
+ *   PAPER_ONLY=fast npx tsx docs/paper/results.ts   # skip crypto+box2d (<1 min)
+ *   PAPER_ONLY=1,6  npx tsx docs/paper/results.ts   # only tables 1 and 6
  *
  * Output is Markdown, ready to paste back into the draft, preceded by a machine-spec
  * block for the `⟨MACHINE SPEC⟩` placeholder (§6 setup).
@@ -26,6 +26,8 @@ import { parse } from "../../src/lang/parse.js";
 import { analyze, kCFA } from "../../src/index.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+/** The bundled Octane `.js` files live in the examples tree, not next to this script. */
+const BENCH_DIR = join(HERE, "../../examples/benchmarks");
 
 /** Each benchmark's whole-program entry sequence (from its `new Benchmark(...)`). */
 const DRIVERS: Record<string, string> = {
@@ -69,7 +71,8 @@ const jobKey = (j: Job): string =>
 // --- child mode: run ONE job in-process, print one RESULT line -----------------
 
 function runOne(j: Job): Result {
-  const prog = j.src ?? `${readFileSync(join(HERE, `${j.bench}.js`), "utf8")}\n;(function(){${DRIVERS[j.bench]}})();\n`;
+  const prog =
+    j.src ?? `${readFileSync(join(BENCH_DIR, `${j.bench}.js`), "utf8")}\n;(function(){${DRIVERS[j.bench]}})();\n`;
   const ast = parse(prog);
   const t = Date.now();
   const r = analyze(ast, kCFA(0, "flow-sensitive", "call-site", j.sc, j.rec, j.gc, j.push, j.st, j.cnt, j.intr));

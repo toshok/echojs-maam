@@ -43,7 +43,7 @@ Open decision. `counting` gives crypto a 12.8× shape reduction (7204 → 561) a
 monomorphism cost, but the paper's §6.1 recommended-config table currently has it
 *off* (counting appears only in the §6.3 ablation). If we decide the win is worth
 making default for allocation-light code, update §6.1 and the `suite` array in
-`examples/benchmarks/paper-results.ts` together. (It must stay off for box2d.)
+`docs/paper/results.ts` together. (It must stay off for box2d.)
 
 ### `putDyn` / `defineAccessor` / `setProto` strong update
 These object-mutating RHS forms currently always weak-join (sound but imprecise),
@@ -161,7 +161,7 @@ the analysis is hampered by the current ANF core. Findings (2026-07):
 
 ### Regenerate all results on the reference machine
 All §6 timings are provisional (dev laptop, Apple Silicon). Re-run
-`examples/benchmarks/paper-results.ts` in one batch on the desktop (AMD Ryzen 7) so
+`docs/paper/results.ts` in one batch on the desktop (AMD Ryzen 7) so
 times are mutually consistent; fill in `⟨MACHINE SPEC⟩`. Structural counts are
 hardware-independent and won't change. Re-confirm per-benchmark valve settings — a
 larger memory/time budget may permit a *higher* state cap (more precision) within

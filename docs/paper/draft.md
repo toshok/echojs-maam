@@ -714,7 +714,8 @@ evaluation.
 > cost — directly testing our totality claim against a non-total analyzer — and
 > (b) a common precision metric (e.g. call-target-set size per site) alongside our
 > monomorphism verdict. Until then, §6.1–6.3 are self-relative (ablations against
-> our own configurations), not comparative.
+> our own configurations), not comparative. A driver scaffold and the metric-
+> translation plan live in [`baselines/`](baselines/) (`run-baselines.sh`).
 >
 > *Fallback if the artifacts prove costly to resurrect* (JSAI is an older
 > Scala/JavaScript research artifact; TAJS is Java but actively maintained): drop to

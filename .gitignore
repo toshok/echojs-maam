@@ -1,3 +1,6 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# baseline comparison scratch output
+docs/paper/baselines/out/

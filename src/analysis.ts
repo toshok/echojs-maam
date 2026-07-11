@@ -18,7 +18,7 @@ import type { Program, Span } from "./lang/ast.js";
 import type { Expr, Loc, Name } from "./lang/core.js";
 import { computeSiteLayouts, defaultSizeOf, structOf, terminalShapes } from "./layout.js";
 import type { SiteLayout, SizeOf, StructLayout } from "./layout.js";
-import type { LambdaInfo } from "./lang/normalize.js";
+import type { DegradedBinding, LambdaInfo } from "./lang/normalize.js";
 import { TOPLEVEL } from "./lang/normalize.js";
 import { shapeToString } from "./lang/shapes.js";
 import type { TypeSig } from "./lang/shapes.js";
@@ -52,7 +52,7 @@ export interface ConstructorReport {
 
 /** A diagnostic surfaced by the analysis. */
 export interface Warning {
-  readonly kind: "polymorphic-constructor" | "polymorphic-function" | "unknown-call";
+  readonly kind: "polymorphic-constructor" | "polymorphic-function" | "unknown-call" | "degraded-binding";
   readonly message: string;
   readonly span?: Span;
 }
@@ -187,11 +187,19 @@ export interface AnalysisMetrics {
   /** Distinct hidden classes interned. */
   readonly shapesInterned: number;
   /**
-   * Call/`new` sites that resolved to no callee (unmodeled externals — builtins,
-   * harness, cross-module). Zero in a closed world; non-zero marks where results
-   * were degraded rather than computed.
+   * Call sites (call/`new`/method/`apply`/tail call) that resolved to no callee
+   * (unmodeled externals — builtins, harness, cross-module, unknown intrinsics).
+   * Zero in a closed world; non-zero marks where results were degraded rather
+   * than computed.
    */
   readonly unknownCalls: number;
+  /**
+   * Bindings the normalizer bound to a degraded value because the construct is
+   * not modeled precisely (e.g. old-esprima rest parameters). Like
+   * `unknownCalls`, non-zero means results were degraded, not computed; each is
+   * also surfaced as a `degraded-binding` warning.
+   */
+  readonly degradedBindings: number;
 }
 
 /** The result of running an analysis. */
@@ -248,6 +256,7 @@ export function analyzeCore<D>(
   lambdaInfo?: ReadonlyMap<Loc, LambdaInfo>,
   retOwner?: ReadonlyMap<Loc, Loc>,
   lambdaParams?: ReadonlyMap<Loc, ReadonlyArray<string>>,
+  degradedBindings?: ReadonlyArray<DegradedBinding>,
 ): AnalysisResult<D> {
   // Build the closure key from `time` so the domain and machine agree on it.
   const ak = addrKey<Loc>(spec.time.key);
@@ -429,10 +438,17 @@ export function analyzeCore<D>(
         ...(s.span ? { span: s.span } : {}),
       });
     }
+    for (const d of degradedBindings ?? []) {
+      out.push({
+        kind: "degraded-binding",
+        message: `binding \`${d.name}\` holds a degraded value: ${d.reason}.`,
+        ...(d.span ? { span: d.span } : {}),
+      });
+    }
     if (machine.unknownCallSites.size > 0) {
       out.push({
         kind: "unknown-call",
-        message: `${machine.unknownCallSites.size} call/new site(s) resolved to no callee (unmodeled external — builtin, harness, or cross-module); their results were degraded. In a closed-world AOT program this should be 0.`,
+        message: `${machine.unknownCallSites.size} call site(s) resolved to no callee (unmodeled external — builtin, harness, cross-module, or unknown intrinsic); their results were degraded. In a closed-world AOT program this should be 0.`,
       });
     }
     return out;
@@ -446,6 +462,7 @@ export function analyzeCore<D>(
     storeObjAddrs: collecting.store.objs.size,
     storeKontAddrs: collecting.store.konts.size,
     unknownCalls: machine.unknownCallSites.size,
+    degradedBindings: degradedBindings?.length ?? 0,
     shapesInterned: machine.shapes.size,
   };
 
@@ -487,6 +504,6 @@ export function analyzeCore<D>(
  */
 export function analyze<D>(program: Program, spec: AnalysisSpec<D>): AnalysisResult<D> {
   assertRestrictions(program);
-  const { core, siteSpans, lambdaInfo, retOwner, lambdaParams } = normalizeProgram(program);
-  return analyzeCore(core, spec, siteSpans, lambdaInfo, retOwner, lambdaParams);
+  const { core, siteSpans, lambdaInfo, retOwner, lambdaParams, degradedBindings } = normalizeProgram(program);
+  return analyzeCore(core, spec, siteSpans, lambdaInfo, retOwner, lambdaParams, degradedBindings);
 }

@@ -41,6 +41,7 @@ export type {
   ConditionalExpression,
   Identifier,
   Literal,
+  CatchClause,
 } from "estree";
 
 /** A half-open source span `[start, end)` in code-unit offsets. */

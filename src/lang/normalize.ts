@@ -21,9 +21,11 @@ import type {
   ArrowFunctionExpression,
   BlockStatement,
   CallExpression,
+  CatchClause,
   Expression as EExpr,
   FunctionDeclaration,
   FunctionExpression,
+  Identifier,
   ModuleDeclaration,
   Node,
   Pattern,
@@ -48,10 +50,32 @@ export class NormalizeError extends Error {
 /** Lexical scope: source name → unique core name. */
 type Scope = ReadonlyMap<string, Name>;
 
+/**
+ * EchoJS/old-esprima function extras: a `defaults` array parallel to `params`
+ * (`null` for params without a default) and a trailing `rest` identifier.
+ * Standard ESTree functions simply have neither field.
+ */
+interface OldFunctionDialect {
+  readonly defaults?: ReadonlyArray<EExpr | null> | null;
+  readonly rest?: Identifier | null;
+}
+
 /** Source info about a lambda, keyed by its core `loc` (for constructor reports). */
 export interface LambdaInfo {
   readonly name?: string;
   readonly span: Span;
+}
+
+/**
+ * A binding the normalizer could not model precisely and bound to a degraded
+ * value instead (e.g. an old-esprima rest parameter). Surfaced through
+ * `AnalysisResult.warnings()` and `metrics.degradedBindings` so a degraded run
+ * is never mistaken for a closed-world one.
+ */
+export interface DegradedBinding {
+  readonly name: string;
+  readonly reason: string;
+  readonly span?: Span;
 }
 
 /** Owner id for top-level code (not inside any function). */
@@ -69,6 +93,8 @@ export function normalizeProgram(program: Program): {
   retOwner: Map<Loc, Loc>;
   /** Lambda loc → its source parameter names (for the specialization report). */
   lambdaParams: Map<Loc, ReadonlyArray<string>>;
+  /** Bindings bound to a degraded value (imprecisely modeled constructs). */
+  degradedBindings: ReadonlyArray<DegradedBinding>;
 } {
   const fresh = new Fresh();
   const n = new Normalizer(fresh);
@@ -92,6 +118,7 @@ export function normalizeProgram(program: Program): {
     lambdaInfo: n.lambdaInfo,
     retOwner: n.retOwner,
     lambdaParams: n.lambdaParams,
+    degradedBindings: n.degradedBindings,
   };
 }
 
@@ -110,6 +137,8 @@ class Normalizer {
   readonly retOwner = new Map<Loc, Loc>();
   /** Lambda loc → source parameter names. */
   readonly lambdaParams = new Map<Loc, ReadonlyArray<string>>();
+  /** Bindings bound to a degraded value (imprecisely modeled constructs). */
+  readonly degradedBindings: DegradedBinding[] = [];
   /** The lambda currently being compiled (`TOPLEVEL` at the program level). */
   private currentOwner: Loc = TOPLEVEL;
   /**
@@ -172,7 +201,7 @@ class Normalizer {
 
     const bindings = funcs.map((f) => ({
       name: scope1.get(fnName(f))!,
-      lam: this.compileFunction(f.params, f.body, scope1, { name: fnName(f), span: spanOf(f) }),
+      lam: this.compileFunction(f.params, f.body, scope1, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
     }));
     return { tag: "letrec", loc: this.fresh.loc(), bindings, body: bodyExpr };
   }
@@ -207,6 +236,12 @@ class Normalizer {
         if (!s.argument) return this.retE(this.litA(litUndef));
         const arg = s.argument;
         if (arg.type === "CallExpression") {
+          // A `%intrinsic(...)` in return position is not a real callee: route
+          // it through `normAtom` so `tryIntrinsic` lowers (or degrades) it,
+          // instead of emitting a tail call to an unbound `%name`. A scope-bound
+          // `%`-name (e.g. a `%super` parameter) stays an ordinary tail call.
+          if (arg.callee.type === "Identifier" && arg.callee.name.startsWith("%") && !scope.has(arg.callee.name))
+            return this.normAtom(arg, scope, (a) => this.retE(a));
           if (arg.callee.type !== "Identifier" && arg.callee.type !== "FunctionExpression" &&
               arg.callee.type !== "ArrowFunctionExpression")
             return this.normAtom(arg, scope, (a) => this.retE(a)); // fall back (may error inside)
@@ -310,15 +345,33 @@ class Normalizer {
     const bodyBranch = this.normStmts(s.block.body, scope, () => toJoin());
     const alts: Expr[] = [bodyBranch];
 
-    if (s.handler) {
-      const param = s.handler.param;
+    // Standard ESTree carries a single `handler`; the EchoJS/old-esprima
+    // dialect instead carries `handlers` (an array) plus SpiderMonkey-era
+    // `guardedHandlers` (`catch (e if cond)`). Every clause is treated as a
+    // reachable alternative; a guard only *restricts* which throws a clause
+    // catches, so evaluating it for its dataflow and taking the handler
+    // unconditionally is a sound over-approximation.
+    const dialect = s as typeof s & {
+      handlers?: ReadonlyArray<CatchClause> | null;
+      guardedHandlers?: ReadonlyArray<CatchClause> | null;
+    };
+    const handlers: CatchClause[] = [];
+    for (const h of [s.handler, ...(dialect.handlers ?? []), ...(dialect.guardedHandlers ?? [])])
+      if (h && !handlers.includes(h)) handlers.push(h);
+
+    for (const handler of handlers) {
+      const param = handler.param;
       let hScope = scope;
       let paramUnique: Name | null = null;
-      if (param && param.type === "Identifier") {
+      if (param) {
+        if (param.type !== "Identifier")
+          throw new NormalizeError("destructuring catch parameters are not supported; use a plain name.");
         paramUnique = this.fresh.name(param.name);
         hScope = new Map(scope).set(param.name, paramUnique);
       }
-      let handlerBranch = this.normStmts(s.handler.body.body, hScope, () => toJoin());
+      let handlerBranch = this.normStmts(handler.body.body, hScope, () => toJoin());
+      const guard = (handler as CatchClause & { guard?: EExpr | null }).guard;
+      if (guard) handlerBranch = this.normAtom(guard, hScope, () => handlerBranch);
       // Bind the caught value (approximated as `undefined`).
       if (paramUnique)
         handlerBranch = this.letE(
@@ -584,7 +637,7 @@ class Normalizer {
         if (self !== undefined) {
           const selfUnique = this.fresh.name(self);
           const inner = new Map(scope).set(self, selfUnique);
-          const lam = this.compileFunction(e.params, e.body, inner, { name: self, span: spanOf(e) });
+          const lam = this.compileFunction(e.params, e.body, inner, { name: self, span: spanOf(e) }, false, e as OldFunctionDialect);
           return {
             tag: "letrec",
             loc: this.fresh.loc(),
@@ -592,10 +645,10 @@ class Normalizer {
             body: k(this.varA(selfUnique)),
           };
         }
-        return k(this.compileFunction(e.params, e.body, scope, { span: spanOf(e) }));
+        return k(this.compileFunction(e.params, e.body, scope, { span: spanOf(e) }, false, e as OldFunctionDialect));
       }
       case "ArrowFunctionExpression":
-        return k(this.compileFunction(e.params, e.body, scope, { span: spanOf(e) }, /* isArrow */ true));
+        return k(this.compileFunction(e.params, e.body, scope, { span: spanOf(e) }, /* isArrow */ true, e as OldFunctionDialect));
       case "BinaryExpression":
         return this.normAtom(e.left as EExpr, scope, (l) =>
           this.normAtom(e.right, scope, (r) => {
@@ -1003,7 +1056,9 @@ class Normalizer {
     const callee = e.callee;
     const args = e.arguments.filter((a): a is EExpr => a.type !== "SpreadElement");
 
-    if (callee.type === "Identifier" && callee.name.startsWith("%")) {
+    // A scope-bound `%`-named identifier (e.g. the `%super` parameter in class
+    // desugar output) is an ordinary variable, not an intrinsic: fall through.
+    if (callee.type === "Identifier" && callee.name.startsWith("%") && !scope.has(callee.name)) {
       switch (callee.name) {
         case "%objectCreate":
           return this.lowerObjectCreate(args[0], scope, k);
@@ -1028,10 +1083,20 @@ class Normalizer {
             }),
           );
         }
-        case "%constructSuperApply":
-          throw new NormalizeError("`%constructSuperApply` (super with spread args) is not modeled yet.");
         default:
-          throw new NormalizeError(`intrinsic \`${callee.name}\` is not modeled yet.`);
+          // An intrinsic we don't model (`%arrayFromSpread`, `%makeGenerator`,
+          // `%constructSuperApply`, …): evaluate the arguments for their
+          // dataflow, then lower to a call whose callee holds no closure — the
+          // machine records the site in `metrics.unknownCalls` and degrades
+          // the result, exactly like any other unknown callee.
+          return this.normArgs(args, scope, (as) => {
+            const t = this.fresh.name();
+            return this.letE(
+              t,
+              { tag: "call", loc: this.fresh.loc(), fn: this.litA(litUndef), args: as },
+              k(this.varA(t)),
+            );
+          });
       }
     }
 
@@ -1233,13 +1298,19 @@ class Normalizer {
     );
   }
 
-  /** Build a lambda atom: fresh param names, body compiled in the extended scope. */
+  /**
+   * Build a lambda atom: fresh param names, body compiled in the extended scope.
+   * `dialect` carries the EchoJS/old-esprima extras riding on the function node:
+   * a `defaults` array parallel to `params` and a trailing `rest` identifier
+   * (in that dialect, params themselves are always plain Identifiers).
+   */
   private compileFunction(
     params: ReadonlyArray<Pattern>,
     body: BlockStatement | EExpr,
     scope: Scope,
     info: LambdaInfo,
     isArrow = false,
+    dialect: OldFunctionDialect = {},
   ): AExp {
     // Allocate the lambda's loc *first* so its body's `ret`s can be attributed to
     // it as they are compiled.
@@ -1261,10 +1332,51 @@ class Normalizer {
       srcNames.push(p.name);
       return u;
     });
-    const coreBody =
+    // The rest parameter is in scope in the body (and in later defaults), but
+    // the machine binds only declared params (extra arguments are dropped), so
+    // the rest array's *contents* are not modeled: bind it to a fresh empty
+    // array — the right type tag, elements degraded — rather than reject the
+    // function, and record the degradation so it is visible in the result.
+    const rest = dialect.rest;
+    let restUnique: Name | null = null;
+    if (rest) {
+      restUnique = this.fresh.name(rest.name);
+      inner.set(rest.name, restUnique);
+      this.degradedBindings.push({
+        name: rest.name,
+        reason: "rest parameter — bound to an empty array; the arguments it would collect are not modeled",
+        span: spanOf(rest),
+      });
+    }
+    let coreBody =
       body.type === "BlockStatement"
         ? this.normStmts(body.body, inner, () => this.retE(this.litA(litUndef)))
         : this.normAtom(body, inner, (a) => this.retE(a));
+
+    // Old-esprima `defaults`: a param that arrived `undefined` takes its
+    // default, evaluated left to right in the function scope (so a later
+    // default may reference an earlier param) — matching EchoJS EIR lowering.
+    // Wrapping from the last default inward makes the first one outermost.
+    const defaults = dialect.defaults ?? [];
+    for (let i = Math.min(defaults.length, uniqueParams.length) - 1; i >= 0; i--) {
+      const dflt = defaults[i];
+      if (!dflt) continue;
+      const pu = uniqueParams[i]!;
+      const isUndef = this.fresh.name();
+      const takeDefault = this.normAtom(dflt, inner, (dv) =>
+        this.letE(this.fresh.name(), { tag: "setVar", loc: this.fresh.loc(), name: pu, val: dv }, coreBody),
+      );
+      coreBody = this.letE(
+        isUndef,
+        { tag: "bin", loc: this.fresh.loc(), op: "===", l: this.varA(pu), r: this.litA(litUndef) },
+        this.ifE(this.varA(isUndef), takeDefault, coreBody),
+      );
+    }
+    if (restUnique && rest) {
+      const restLoc = this.fresh.loc();
+      this.siteSpans.set(restLoc, spanOf(rest));
+      coreBody = this.letE(restUnique, { tag: "array", loc: restLoc, elems: [] }, coreBody);
+    }
 
     this.currentOwner = savedOwner;
     this.currentThisOwner = savedThisOwner;

@@ -205,7 +205,7 @@ export function makeMachine<D>(
   /** State-cap: distinct continuation-address keys seen per function (loc). */
   const funcContexts = new Map<Loc, Set<string>>();
 
-  /** Call/`new` sites that hit an unmodeled (closureless) callee — see the interface field. */
+  /** Call/`new`/method/`apply`/tail-call sites that hit an unmodeled (closureless) callee — see the interface field. */
   const unknownCallSites = new Set<Loc>();
   function recordUnknownCall(loc: Loc): void {
     unknownCallSites.add(loc);
@@ -1293,7 +1293,10 @@ export function makeMachine<D>(
               const fnVal = atomEval(r.fn, c.env, store);
               const thisVal = atomEval(r.thisArg, c.env, store);
               const clos = domain.elimClo(fnVal).toArray();
-              if (clos.length === 0) return degrade(domain.lit(litUndef), store);
+              if (clos.length === 0) {
+                recordUnknownCall(r.loc);
+                return degrade(domain.lit(litUndef), store);
+              }
               return mplusAll(
                 M,
                 clos.map((clo) =>
@@ -1352,7 +1355,10 @@ export function makeMachine<D>(
               }
               // No resolvable method (receiver isn't a tracked object, or the
               // property holds no closure) ⇒ degrade rather than abort.
-              if (branches.length === 0) return degrade(domain.lit(litUndef), store);
+              if (branches.length === 0) {
+                recordUnknownCall(r.loc);
+                return degrade(domain.lit(litUndef), store);
+              }
               return mplusAll(M, branches);
             }
 
@@ -1468,12 +1474,14 @@ export function makeMachine<D>(
           case "tailcall": {
             const fv = atomEval(e.fn, c.env, store);
             const argVals = e.args.map((a) => atomEval(a, c.env, store));
+            const targets = domain.elimClo(fv).toArray();
+            // A tail call with no callee has no `let` body to degrade into —
+            // the path simply ends — but record it so `metrics.unknownCalls`
+            // still reports the open world.
+            if (targets.length === 0) recordUnknownCall(e.loc);
             return mplusAll(
               M,
-              domain
-                .elimClo(fv)
-                .toArray()
-                .map((clo) => enterClosure(M, clo, argVals, e.loc, e.loc, c.time, store, null, c.kaddr, null)),
+              targets.map((clo) => enterClosure(M, clo, argVals, e.loc, e.loc, c.time, store, null, c.kaddr, null)),
             );
           }
 

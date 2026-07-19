@@ -96,6 +96,17 @@ export interface Machine<Ctx, D> {
    * set should be *empty*; a non-empty set is a soundness caveat, not a fact.
    */
   readonly unknownCallSites: ReadonlySet<Loc>;
+  /**
+   * Cap-saturation telemetry: how often (and where) convergence was *forced* by
+   * a widening cap rather than reached naturally. `stateCapHits` counts calls
+   * routed through a widened continuation address (with the functions affected);
+   * `shapeCapHits` counts shape-set collapses to the megamorphic ⊤ shape.
+   */
+  readonly capStats: {
+    stateCapHits: number;
+    readonly stateCapFuncs: ReadonlySet<Loc>;
+    shapeCapHits: number;
+  };
   /** Build the initial control state and store for a whole program. */
   inject(program: Expr): { c0: ControlState<Ctx>; s0: Store<Ctx, D> };
   /** The step relation, written against the monad `M`. */
@@ -207,6 +218,9 @@ export function makeMachine<D>(
 
   /** Call/`new`/method/`apply`/tail-call sites that hit an unmodeled (closureless) callee — see the interface field. */
   const unknownCallSites = new Set<Loc>();
+
+  /** Cap-saturation telemetry — see the interface field. */
+  const capStats = { stateCapHits: 0, stateCapFuncs: new Set<Loc>(), shapeCapHits: 0 };
   function recordUnknownCall(loc: Loc): void {
     unknownCallSites.add(loc);
   }
@@ -755,6 +769,9 @@ export function makeMachine<D>(
    * walk (the abstract heap is finite, so cycles terminate).
    */
   function readProp(objVal: D, key: PropName, store: Store<Ctx, D>): D {
+    // A ⊤ receiver: its objects cannot be enumerated, so any property may hold
+    // any value.
+    if (domain.isTop(objVal)) return domain.top;
     let result = DJ.bot;
 
     // `F.prototype` — a property read on a function value.
@@ -799,6 +816,9 @@ export function makeMachine<D>(
     key: PropName,
     store: Store<Ctx, D>,
   ): { data: D; sawUndefined: boolean; getters: D; setters: D } {
+    // A ⊤ receiver reads as ⊤ (any property, any value); accessor dispatch on it
+    // is not enumerable — the data path carries the whole approximation.
+    if (domain.isTop(objVal)) return { data: domain.top, sawUndefined: false, getters: DJ.bot, setters: DJ.bot };
     let data = DJ.bot;
     let getters = DJ.bot;
     let setters = DJ.bot;
@@ -883,6 +903,7 @@ export function makeMachine<D>(
         const merged = existing.shapes.union(transitioned);
         const mergedArr = merged.toArray();
         const capped = shapes.capShapeSet(mergedArr, shapeCap);
+        if (capped !== mergedArr) capStats.shapeCapHits++;
         out = out.set(oaddr, {
           shapes: capped === mergedArr ? merged : FinSet.fromIterable(shapeKey, capped),
           fields: existing.fields.joinAt(DJ, key, val),
@@ -956,6 +977,8 @@ export function makeMachine<D>(
           set.add(nk);
           kaddr = normalKaddr;
         } else {
+          capStats.stateCapHits++;
+          capStats.stateCapFuncs.add(clo.loc);
           kaddr = { loc: clo.loc, time: time.tzero, w: true };
         }
       } else {
@@ -1177,8 +1200,10 @@ export function makeMachine<D>(
                   // A purely-numeric key is an array index (elements only); a
                   // string/unknown key may also hit any named field.
                   const numericKey = domain.typeSig(atomEval(r.keyExpr, c.env, store)) === "num";
+                  const objV = atomEval(r.obj, c.env, store);
                   let out = domain.lit(litUndef);
-                  for (const oaddr of domain.elimObj(atomEval(r.obj, c.env, store))) {
+                  if (domain.isTop(objV)) out = DJ.join(out, domain.top); // unknown receiver: any value
+                  for (const oaddr of domain.elimObj(objV)) {
                     const o = objs.getOr(oaddr, objLat.bot);
                     out = DJ.join(out, o.elements);
                     if (!numericKey) for (const fv of o.fields.values()) out = DJ.join(out, fv);
@@ -1213,7 +1238,42 @@ export function makeMachine<D>(
                     if (!DJ.lte(o.elements, DJ.bot)) out = DJ.join(out, domain.topString());
                     for (const p of o.proto) collect(p);
                   };
-                  for (const oaddr of domain.elimObj(atomEval(r.obj, c.env, store))) collect(oaddr);
+                  const keysObjV = atomEval(r.obj, c.env, store);
+                  // An unknown receiver may have any enumerable key (keys are
+                  // always strings, so ⊤-string is the precise degradation).
+                  if (domain.isTop(keysObjV)) out = DJ.join(out, domain.topString());
+                  for (const oaddr of domain.elimObj(keysObjV)) collect(oaddr);
+                  v = out;
+                  break;
+                }
+                case "iterElem": {
+                  // What `for-of` (or an array-pattern rest) binds per iteration:
+                  // the join of the element buckets of the arrays `obj` may be.
+                  // Anything whose elements are untracked — an unknown value, a
+                  // closure (generator), an object with a ⊥ element bucket (a
+                  // possibly-non-array iterable, or a genuinely empty array) —
+                  // degrades to ⊤ and counts as an unknown-call-class event.
+                  const src = atomEval(r.obj, c.env, store);
+                  let out: D = DJ.bot;
+                  let degraded = domain.isTop(src) || !domain.elimClo(src).isEmpty();
+                  for (const oaddr of domain.elimObj(src)) {
+                    const o = objs.getOr(oaddr, objLat.bot);
+                    if (DJ.lte(o.elements, DJ.bot)) degraded = true;
+                    else out = DJ.join(out, o.elements);
+                  }
+                  // Closures in the element join are the fingerprint of a
+                  // non-array object whose bucket was filled by computed writes
+                  // (`o[k] = fn`) — possibly a hand-rolled iterable whose real
+                  // iteration yields something else. Degrade. (Cost: for-of
+                  // over a genuine array OF FUNCTIONS also degrades to ⊤.)
+                  if (!domain.elimClo(out).isEmpty()) degraded = true;
+                  // Strings are iterable; their elements are (some) strings.
+                  if (!domain.isTop(src) && domain.typeSig(src).split("|").includes("str"))
+                    out = DJ.join(out, domain.topString());
+                  if (degraded) {
+                    recordUnknownCall(r.loc);
+                    out = DJ.join(out, domain.top);
+                  }
                   v = out;
                   break;
                 }
@@ -1295,7 +1355,7 @@ export function makeMachine<D>(
               const clos = domain.elimClo(fnVal).toArray();
               if (clos.length === 0) {
                 recordUnknownCall(r.loc);
-                return degrade(domain.lit(litUndef), store);
+                return degrade(domain.top, store); // unknown callee could return anything
               }
               return mplusAll(
                 M,
@@ -1357,7 +1417,7 @@ export function makeMachine<D>(
               // property holds no closure) ⇒ degrade rather than abort.
               if (branches.length === 0) {
                 recordUnknownCall(r.loc);
-                return degrade(domain.lit(litUndef), store);
+                return degrade(domain.top, store); // unknown method could return anything
               }
               return mplusAll(M, branches);
             }
@@ -1407,9 +1467,12 @@ export function makeMachine<D>(
               // genuine unknown callee — record and degrade.
               if (intrBranches.length > 0) return mplusAll(M, intrBranches);
               recordUnknownCall(r.loc);
-              // `new Unknown()` yields the freshly-allocated (empty, shapeless)
-              // object; an unknown plain call yields `undefined`.
-              return degrade(newObj ? domain.objRef(newObj) : domain.lit(litUndef), store1);
+              // An unknown callee — plain call or `new` — could return anything
+              // (⊤). Binding the freshly-allocated `this` for an unknown `new`
+              // would be worse than ⊤: every property read on that empty object
+              // resolves to a confident `undefined`. (The orphan allocation may
+              // remain in the heap; nothing references it.)
+              return degrade(domain.top, store1);
             }
             return mplusAll(M, [
               ...intrBranches,
@@ -1603,6 +1666,7 @@ export function makeMachine<D>(
     accessorSetSites,
     specObservations: specObs,
     unknownCallSites,
+    capStats,
     inject,
     step,
     gcStore,

@@ -38,7 +38,7 @@ import { spanOf } from "./ast.js";
 /** A top-level item: an ordinary statement or an ES module declaration. */
 type Stmt = Statement | ModuleDeclaration;
 import type { AExp, BinOp, Expr, Lit, Loc, Name, RHS, UnOp } from "./core.js";
-import { Fresh, litBool, litNull, litNum, litStr, litUndef, thisVarName } from "./core.js";
+import { Fresh, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
 
 export class NormalizeError extends Error {
   constructor(message: string) {
@@ -220,8 +220,19 @@ class Normalizer {
         const go = (i: number, sc: Scope): Expr => {
           if (i >= decls.length) return k(sc);
           const d = decls[i]!;
-          if (d.id.type !== "Identifier")
-            throw new NormalizeError("destructuring patterns are not supported; use a plain name.");
+          if (d.id.type !== "Identifier") {
+            // Destructuring declaration: bind the initializer to a temp, then
+            // decompose the pattern into property/element reads.
+            if (d.id.type !== "ObjectPattern" && d.id.type !== "ArrayPattern")
+              throw new NormalizeError("destructuring patterns are not supported; use a plain name.");
+            if (d.init === null || d.init === undefined)
+              throw new NormalizeError("a destructuring declaration requires an initializer.");
+            const sc2 = new Map(sc);
+            for (const n of patternNames(d.id)) sc2.set(n, this.fresh.name(n));
+            const tmp = this.fresh.name("destr");
+            const cont = go(i + 1, sc2);
+            return this.normNamed(d.init, sc, tmp, this.bindPattern(d.id, this.varA(tmp), sc2, cont));
+          }
           const src = d.id.name;
           const unique = this.fresh.name(src);
           const sc2 = new Map(sc).set(src, unique);
@@ -277,6 +288,8 @@ class Normalizer {
         return this.normSwitch(s, scope, k);
       case "ForInStatement":
         return this.normForIn(s, scope, k);
+      case "ForOfStatement":
+        return this.normForOf(s, scope, k);
       case "BreakStatement": {
         if (s.label) throw new NormalizeError("labeled `break` is not supported.");
         const ctx = this.loopStack[this.loopStack.length - 1];
@@ -297,17 +310,25 @@ class Normalizer {
         return this.normTry(s, scope, k);
       // --- modules (EchoJS desugars these; handled here for robustness) --------
       case "ImportDeclaration": {
-        // Bind imported names to `undefined` (opaque). The real analysis of a
-        // multi-module program links exports; that is future work.
+        // Bind imported names to ⊤ (an import is a real value we know nothing
+        // about — binding `undefined` would be unsound as a *type*), and record
+        // each one: an imports-only-degraded module must not read as a closed
+        // world. The real analysis of a multi-module program links exports;
+        // that is future work.
         let sc = scope;
         for (const spec of s.specifiers) {
           const local = spec.local.name;
           sc = new Map(sc).set(local, this.fresh.name(local));
+          this.degradedBindings.push({
+            name: local,
+            reason: "unmodeled import — bound to ⊤; cross-module linking is not analyzed",
+            span: spanOf(spec),
+          });
         }
         const go = (i: number, sci: Scope): Expr => {
           if (i >= s.specifiers.length) return k(sci);
           const unique = sci.get(s.specifiers[i]!.local.name)!;
-          return this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litUndef) }, go(i + 1, sci));
+          return this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litTop) }, go(i + 1, sci));
         };
         return go(0, sc);
       }
@@ -372,11 +393,12 @@ class Normalizer {
       let handlerBranch = this.normStmts(handler.body.body, hScope, () => toJoin());
       const guard = (handler as CatchClause & { guard?: EExpr | null }).guard;
       if (guard) handlerBranch = this.normAtom(guard, hScope, () => handlerBranch);
-      // Bind the caught value (approximated as `undefined`).
+      // Bind the caught value: any value may be thrown, so the param is ⊤
+      // (throw-site tracking would be the precise fix).
       if (paramUnique)
         handlerBranch = this.letE(
           paramUnique,
-          { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litUndef) },
+          { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litTop) },
           handlerBranch,
         );
       alts.push(handlerBranch);
@@ -551,6 +573,61 @@ class Normalizer {
         { tag: "keys", loc: this.fresh.loc(), obj: objAtom },
         this.emitLoop(loop, brk, loopBody, k(scope)),
       );
+    });
+  }
+
+  /**
+   * `for (x of arr) body` — EchoJS EIR lowers `for-of` natively, so post-desugar
+   * trees still contain it. Model: evaluate the RHS once and read its abstract
+   * per-iteration element (`iterElem` — the join of the element buckets of the
+   * arrays it may be; anything untracked degrades to ⊤ and is counted). The loop
+   * itself is the same nondeterministic exit-or-iterate fixpoint as `for-in`:
+   * each round either stops or binds the loop variable to *some* element and
+   * runs the body — sound for any element order and any number of rounds.
+   */
+  private normForOf(s: Extract<Statement, { type: "ForOfStatement" }>, scope: Scope, k: (s: Scope) => Expr): Expr {
+    const left = s.left;
+    let bodyScope: Scope;
+    let bindElem: (val: AExp, cont: Expr) => Expr;
+    if (left.type === "VariableDeclaration") {
+      const id = left.declarations[0]!.id;
+      if (id.type !== "Identifier") throw new NormalizeError("`for-of` requires a simple variable name.");
+      const unique = this.fresh.name(id.name);
+      bodyScope = new Map(scope).set(id.name, unique);
+      bindElem = (val, cont) => this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: val }, cont);
+    } else if (left.type === "Identifier") {
+      const unique = scope.get(left.name) ?? left.name;
+      bodyScope = scope;
+      bindElem = (val, cont) =>
+        this.letE(this.fresh.name(), { tag: "setVar", loc: this.fresh.loc(), name: unique, val }, cont);
+    } else {
+      throw new NormalizeError("`for-of` target must be a variable.");
+    }
+
+    return this.normAtom(s.right as EExpr, scope, (objAtom) => {
+      const el = this.fresh.name("elem");
+      const loop = this.fresh.name("loop");
+      const brk = this.fresh.name("brk");
+      this.loopStack.push({
+        onBreak: () => this.tailE(this.varA(brk), []),
+        onContinue: () => this.tailE(this.varA(loop), [this.varA(brk)]),
+      });
+      const bodyExpr = this.normStmt(s.body, bodyScope, () => this.tailE(this.varA(loop), [this.varA(brk)]));
+      this.loopStack.pop();
+      // Each round: either stop, or bind the loop var to an element and run the
+      // body. `iterElem` is read INSIDE the loop, so mutations the body makes to
+      // the iterated array (a live iterator observes appends) reach the loop
+      // variable on the next fixpoint round.
+      const loopBody: Expr = this.letE(
+        el,
+        { tag: "iterElem", loc: this.fresh.loc(), obj: objAtom },
+        {
+          tag: "nondet",
+          loc: this.fresh.loc(),
+          alts: [this.tailE(this.varA(brk), []), bindElem(this.varA(el), bodyExpr)],
+        },
+      );
+      return this.emitLoop(loop, brk, loopBody, k(scope));
     });
   }
 
@@ -799,9 +876,65 @@ class Normalizer {
       }
       case "UpdateExpression":
         return this.normUpdate(e, scope, k);
+      case "TemplateLiteral":
+        return this.normTemplate(e, scope, k);
+      case "TaggedTemplateExpression": {
+        // Not modeled: evaluate the tag and every interpolated expression for
+        // their dataflow, then lower to a call whose callee holds no closure —
+        // counted in `metrics.unknownCalls`, result ⊤ (same treatment as an
+        // unknown `%`-intrinsic).
+        const exprs = e.quasi.expressions;
+        return this.normAtom(e.tag as EExpr, scope, () => {
+          const go = (i: number): Expr => {
+            if (i >= exprs.length) {
+              const t = this.fresh.name();
+              return this.letE(
+                t,
+                { tag: "call", loc: this.fresh.loc(), fn: this.litA(litUndef), args: [] },
+                k(this.varA(t)),
+              );
+            }
+            return this.normAtom(exprs[i] as EExpr, scope, () => go(i + 1));
+          };
+          return go(0);
+        });
+      }
       default:
         throw new NormalizeError(`unsupported expression: ${e.type}`);
     }
+  }
+
+  /**
+   * `` `a${x}b` `` — string concatenation with an implicit ToString on each
+   * interpolated expression: `"a" + toStr(x) + "b"`. Expressions are evaluated
+   * left to right; the result is always string-typed (the `toStr` unop
+   * guarantees ⊆ string even for ⊤ operands).
+   */
+  private normTemplate(
+    e: EExpr & { type: "TemplateLiteral" },
+    scope: Scope,
+    k: (a: AExp) => Expr,
+  ): Expr {
+    const quasis = e.quasis;
+    const exprs = e.expressions;
+    const cooked = (i: number): string => quasis[i]?.value.cooked ?? "";
+    // Bind `name = l + r; cont(name)` — one concat step.
+    const concat = (l: AExp, r: AExp, cont: (a: AExp) => Expr): Expr => {
+      const t = this.fresh.name();
+      return this.letE(t, { tag: "bin", loc: this.fresh.loc(), op: "+", l, r }, cont(this.varA(t)));
+    };
+    const go = (i: number, acc: AExp): Expr => {
+      if (i >= exprs.length) return k(acc);
+      return this.normAtom(exprs[i] as EExpr, scope, (ev) => {
+        const s = this.fresh.name();
+        return this.letE(s, { tag: "un", loc: this.fresh.loc(), op: "toStr", arg: ev }, // ToString(xᵢ)
+          concat(acc, this.varA(s), (acc2) =>
+            concat(acc2, this.litA(litStr(cooked(i + 1))), (acc3) => go(i + 1, acc3)),
+          ),
+        );
+      });
+    };
+    return go(0, this.litA(litStr(cooked(0))));
   }
 
   /** Lower `x = v` / `obj.p = v` / `x += v` (variable or property assignment). */
@@ -1324,19 +1457,31 @@ class Normalizer {
 
     const inner = new Map(scope);
     const srcNames: string[] = [];
+    // A pattern parameter (ObjectPattern/ArrayPattern) becomes a synthetic
+    // positional param whose destructuring reads are prologue-wrapped around
+    // the body (after the whole-pattern default, matching EIR order).
+    const patternParams: Array<{ pattern: Pattern; unique: Name }> = [];
     const uniqueParams = params.map((p) => {
-      if (p.type !== "Identifier")
-        throw new NormalizeError("only plain identifier parameters are supported (no destructuring/defaults/rest).");
-      const u = this.fresh.name(p.name);
-      inner.set(p.name, u);
-      srcNames.push(p.name);
-      return u;
+      if (p.type === "Identifier") {
+        const u = this.fresh.name(p.name);
+        inner.set(p.name, u);
+        srcNames.push(p.name);
+        return u;
+      }
+      if (p.type === "ObjectPattern" || p.type === "ArrayPattern") {
+        const u = this.fresh.name("pat");
+        for (const n of patternNames(p)) inner.set(n, this.fresh.name(n));
+        patternParams.push({ pattern: p, unique: u });
+        srcNames.push("<pattern>");
+        return u;
+      }
+      throw new NormalizeError("only plain identifier or destructuring-pattern parameters are supported.");
     });
     // The rest parameter is in scope in the body (and in later defaults), but
     // the machine binds only declared params (extra arguments are dropped), so
-    // the rest array's *contents* are not modeled: bind it to a fresh empty
-    // array — the right type tag, elements degraded — rather than reject the
-    // function, and record the degradation so it is visible in the result.
+    // the rest array's *contents* are not modeled: bind it to an array whose
+    // element bucket is ⊤ — the right type tag, unknown contents — rather than
+    // reject the function, and record the degradation so it is visible.
     const rest = dialect.rest;
     let restUnique: Name | null = null;
     if (rest) {
@@ -1344,7 +1489,7 @@ class Normalizer {
       inner.set(rest.name, restUnique);
       this.degradedBindings.push({
         name: rest.name,
-        reason: "rest parameter — bound to an empty array; the arguments it would collect are not modeled",
+        reason: "rest parameter — bound to an array of unknown (⊤) contents; the arguments it would collect are not tracked individually",
         span: spanOf(rest),
       });
     }
@@ -1352,6 +1497,15 @@ class Normalizer {
       body.type === "BlockStatement"
         ? this.normStmts(body.body, inner, () => this.retE(this.litA(litUndef)))
         : this.normAtom(body, inner, (a) => this.retE(a));
+
+    // Destructure pattern params (innermost wrap: runs after defaults, before
+    // the body — the whole-pattern default in `defaults[i]` applies to the
+    // synthetic param, then the pattern decomposes whatever value it holds).
+    // Wrapping from the last pattern inward keeps left-to-right read order.
+    for (let i = patternParams.length - 1; i >= 0; i--) {
+      const pp = patternParams[i]!;
+      coreBody = this.bindPattern(pp.pattern, this.varA(pp.unique), inner, coreBody);
+    }
 
     // Old-esprima `defaults`: a param that arrived `undefined` takes its
     // default, evaluated left to right in the function scope (so a later
@@ -1375,7 +1529,18 @@ class Normalizer {
     if (restUnique && rest) {
       const restLoc = this.fresh.loc();
       this.siteSpans.set(restLoc, spanOf(rest));
-      coreBody = this.letE(restUnique, { tag: "array", loc: restLoc, elems: [] }, coreBody);
+      // An array of unknown contents AND unknown length (the machine pins an
+      // array literal's `length` to its element count — join it up to ⊤, or
+      // `r.length` would read as the constant 1).
+      coreBody = this.letE(
+        restUnique,
+        { tag: "array", loc: restLoc, elems: [this.litA(litTop)] },
+        this.letE(
+          this.fresh.name(),
+          { tag: "put", loc: this.fresh.loc(), obj: this.varA(restUnique), key: "length", val: this.litA(litTop) },
+          coreBody,
+        ),
+      );
     }
 
     this.currentOwner = savedOwner;
@@ -1383,6 +1548,109 @@ class Normalizer {
     this.lambdaInfo.set(lamLoc, info);
     this.lambdaParams.set(lamLoc, srcNames);
     return { tag: "lam", loc: lamLoc, params: uniqueParams, body: coreBody };
+  }
+
+  /**
+   * Decompose `pattern` against the value held in `src`, binding every
+   * identifier leaf to its (pre-registered via {@link patternNames}) unique
+   * name in `scope`, then continue with `cont`. Object patterns become
+   * property reads; array patterns become index reads (the smashed element
+   * bucket, so a read is element-join ⊔ undefined); pattern defaults use the
+   * same `=== undefined` rule as parameter defaults (evaluated in `scope`,
+   * left to right); an array rest binds a fresh array carrying the source's
+   * per-iteration element approximation. `cont` is shared across default
+   * branches — the established shared-continuation idiom.
+   */
+  private bindPattern(pattern: Pattern, src: AExp, scope: Scope, cont: Expr): Expr {
+    switch (pattern.type) {
+      case "Identifier": {
+        const unique = scope.get(pattern.name);
+        if (!unique)
+          throw new NormalizeError(`internal: pattern name \`${pattern.name}\` was not pre-registered.`);
+        return this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: src }, cont);
+      }
+      case "AssignmentPattern": {
+        // `p = dflt` inside a pattern: the leaf takes the default when the
+        // incoming value is `undefined` (the parameter-default rule).
+        const isUndef = this.fresh.name();
+        const takeDefault = this.normAtom(pattern.right as EExpr, scope, (dv) =>
+          this.bindPattern(pattern.left, dv, scope, cont),
+        );
+        return this.letE(
+          isUndef,
+          { tag: "bin", loc: this.fresh.loc(), op: "===", l: src, r: this.litA(litUndef) },
+          this.ifE(this.varA(isUndef), takeDefault, this.bindPattern(pattern.left, src, scope, cont)),
+        );
+      }
+      case "ObjectPattern": {
+        const props = pattern.properties;
+        const go = (i: number): Expr => {
+          if (i >= props.length) return cont;
+          const p = props[i]!;
+          if (p.type !== "Property")
+            throw new NormalizeError("object rest patterns (`{...r}`) are not supported.");
+          if (p.computed) throw new NormalizeError("computed keys in object patterns are not supported.");
+          const key = propKeyName(p.key as Node);
+          const t = this.fresh.name();
+          const getLoc = this.fresh.loc();
+          this.siteSpans.set(getLoc, spanOf(p as unknown as Node));
+          return this.letE(
+            t,
+            { tag: "get", loc: getLoc, obj: src, key },
+            this.bindPattern(p.value as Pattern, this.varA(t), scope, go(i + 1)),
+          );
+        };
+        return go(0);
+      }
+      case "ArrayPattern": {
+        // EchoJS dialect note: a declaration-position rest parses as
+        // SpreadElement (assignment-position as RestElement) — accept both.
+        const elems = pattern.elements as ReadonlyArray<
+          (Pattern | { type: "SpreadElement" | "RestElement"; argument: Pattern }) | null
+        >;
+        const go = (i: number): Expr => {
+          if (i >= elems.length) return cont;
+          const el = elems[i];
+          if (!el) return go(i + 1); // elision (hole)
+          if (el.type === "SpreadElement" || el.type === "RestElement") {
+            const target = el.argument;
+            if (target.type !== "Identifier")
+              throw new NormalizeError("an array-pattern rest target must be a plain name.");
+            const unique = scope.get(target.name);
+            if (!unique)
+              throw new NormalizeError(`internal: pattern name \`${target.name}\` was not pre-registered.`);
+            // Bind an array whose elements are the source's per-iteration
+            // element approximation (a sound per-element over-approximation
+            // of the tail; untracked sources degrade to ⊤ and are counted).
+            // Its `length` is unknown — join it up to ⊤ so it never reads as
+            // the constant 1 the allocation would otherwise pin.
+            const elName = this.fresh.name("elem");
+            return this.letE(
+              elName,
+              { tag: "iterElem", loc: this.fresh.loc(), obj: src },
+              this.letE(
+                unique,
+                { tag: "array", loc: this.fresh.loc(), elems: [this.varA(elName)] },
+                this.letE(
+                  this.fresh.name(),
+                  { tag: "put", loc: this.fresh.loc(), obj: this.varA(unique), key: "length", val: this.litA(litTop) },
+                  go(i + 1),
+                ),
+              ),
+            );
+          }
+          const t = this.fresh.name();
+          return this.letE(
+            t,
+            { tag: "getDyn", loc: this.fresh.loc(), obj: src, keyExpr: this.litA(litNum(i)) },
+            this.bindPattern(el as Pattern, this.varA(t), scope, go(i + 1)),
+          );
+        };
+        return go(0);
+      }
+      default:
+        throw new NormalizeError(`unsupported pattern: ${(pattern as { type: string }).type}`);
+    }
   }
 }
 
@@ -1423,6 +1691,42 @@ function propKeyNameSafe(key: Node): string | null {
     if (typeof v === "string" || typeof v === "number") return String(v);
   }
   return null;
+}
+
+/**
+ * Every identifier a pattern binds (object/array/default/rest, any nesting) —
+ * used to pre-register unique names before {@link Normalizer.bindPattern}
+ * decomposes the pattern. Unsupported leaves are ignored here; `bindPattern`
+ * rejects them with a precise error when it reaches them.
+ */
+function patternNames(p: Node): string[] {
+  const out: string[] = [];
+  const walkP = (n: Node | null | undefined): void => {
+    if (!n) return;
+    switch (n.type) {
+      case "Identifier":
+        out.push((n as { name: string }).name);
+        return;
+      case "ObjectPattern":
+        for (const pr of (n as unknown as { properties: Node[] }).properties) {
+          if (pr.type === "Property") walkP((pr as unknown as { value: Node }).value);
+          else walkP((pr as unknown as { argument?: Node }).argument);
+        }
+        return;
+      case "ArrayPattern":
+        for (const el of (n as unknown as { elements: (Node | null)[] }).elements) walkP(el);
+        return;
+      case "AssignmentPattern":
+        return walkP((n as unknown as { left: Node }).left);
+      case "RestElement":
+      case "SpreadElement":
+        return walkP((n as unknown as { argument: Node }).argument);
+      default:
+        return;
+    }
+  };
+  walkP(p);
+  return out;
 }
 
 /** Extract a static property name from an object-literal key node. */

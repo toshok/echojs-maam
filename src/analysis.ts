@@ -200,6 +200,16 @@ export interface AnalysisMetrics {
    * also surfaced as a `degraded-binding` warning.
    */
   readonly degradedBindings: number;
+  /**
+   * How many calls were routed through a widened (`stateCap`-saturated)
+   * continuation address, i.e. convergence was *forced*, not natural. Zero
+   * means the cap never fired.
+   */
+  readonly stateCapHits: number;
+  /** Distinct functions whose calling contexts hit the state cap. */
+  readonly stateCapFuncs: number;
+  /** How many shape sets were collapsed to the megamorphic ⊤ shape by `shapeCap`. */
+  readonly shapeCapHits: number;
 }
 
 /** The result of running an analysis. */
@@ -464,6 +474,9 @@ export function analyzeCore<D>(
     unknownCalls: machine.unknownCallSites.size,
     degradedBindings: degradedBindings?.length ?? 0,
     shapesInterned: machine.shapes.size,
+    stateCapHits: machine.capStats.stateCapHits,
+    stateCapFuncs: machine.capStats.stateCapFuncs.size,
+    shapeCapHits: machine.capStats.shapeCapHits,
   };
 
   const describeSpec = { domain: domain.name, time: spec.time.name, sensitivity: spec.sensitivity };
@@ -491,7 +504,8 @@ export function analyzeCore<D>(
         `  states:      ${metrics.reachedStates}\n` +
         `  configs:     ${metrics.configs}\n` +
         `  store:       ${metrics.storeValAddrs} vals · ${metrics.storeObjAddrs} objs · ${metrics.storeKontAddrs} konts\n` +
-        `  shapes:      ${metrics.shapesInterned}`
+        `  shapes:      ${metrics.shapesInterned}\n` +
+        `  caps:        stateCap ${metrics.stateCapHits} hit(s) across ${metrics.stateCapFuncs} function(s) · shapeCap ${metrics.shapeCapHits} hit(s)`
       );
     },
   };

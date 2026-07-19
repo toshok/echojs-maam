@@ -28,13 +28,19 @@ export type Name = string;
  */
 export const thisVarName = (lamLoc: Loc): Name => `this$${lamLoc}`;
 
-/** Primitive literal values of the dialect. */
+/**
+ * Primitive literal values of the dialect, plus the degradation literal `top`:
+ * "any value, no information".  `top` is not surface syntax — the normalizer
+ * emits it where a value exists but cannot be modeled (unmodeled imports, rest
+ * array contents), and the domains map it to their `⊤` element.
+ */
 export type Lit =
   | { readonly kind: "num"; readonly value: number }
   | { readonly kind: "bool"; readonly value: boolean }
   | { readonly kind: "str"; readonly value: string }
   | { readonly kind: "null" }
-  | { readonly kind: "undef" };
+  | { readonly kind: "undef" }
+  | { readonly kind: "top" };
 
 /**
  * Atomic expressions — evaluated by the machine's pure `atomEval`, never
@@ -59,8 +65,12 @@ export type BinOp =
   | "&" | "|" | "^" | "<<" | ">>" | ">>>"
   | "instanceof" | "in";
 
-/** Unary primitive operators. */
-export type UnOp = "-" | "+" | "!" | "~" | "typeof" | "void";
+/**
+ * Unary primitive operators. `toStr` is not surface syntax: the normalizer
+ * inserts it for the implicit ToString a template literal performs on each
+ * interpolated expression (its result is always string-typed).
+ */
+export type UnOp = "-" | "+" | "!" | "~" | "typeof" | "void" | "toStr";
 
 /**
  * The right-hand side of a `Let`: something that produces a value to bind. Either
@@ -89,6 +99,14 @@ export type RHS =
   | { readonly tag: "putDyn"; readonly loc: Loc; readonly obj: AExp; readonly keyExpr: AExp; readonly val: AExp }
   /** Enumerable property *names* of `obj` (own + inherited), as an abstract string value — for `for-in`. */
   | { readonly tag: "keys"; readonly loc: Loc; readonly obj: AExp }
+  /**
+   * An element `obj` yields under iteration (`for-of`, array-pattern rest): the
+   * join of the element buckets of the arrays it may be. Iterating anything
+   * whose elements are not tracked (an unknown value, a closure, an object with
+   * no element bucket — possibly a non-array iterable) degrades to `⊤` and is
+   * recorded as an unknown-call-class event.
+   */
+  | { readonly tag: "iterElem"; readonly loc: Loc; readonly obj: AExp }
   /** `new fn(args)`: allocate an object, run `fn` as a constructor with `this` bound to it. */
   | { readonly tag: "new"; readonly loc: Loc; readonly fn: AExp; readonly args: ReadonlyArray<AExp> }
   /** `obj.key(args)`: read the method from `obj`, call it with `this` bound to `obj`. */
@@ -160,6 +178,7 @@ export const litBool = (value: boolean): Lit => ({ kind: "bool", value });
 export const litStr = (value: string): Lit => ({ kind: "str", value });
 export const litNull: Lit = { kind: "null" };
 export const litUndef: Lit = { kind: "undef" };
+export const litTop: Lit = { kind: "top" };
 
 /**
  * A monotonic source of fresh locations and names, threaded through
@@ -190,6 +209,8 @@ export function litToString(l: Lit): string {
       return "null";
     case "undef":
       return "undefined";
+    case "top":
+      return "⊤";
   }
 }
 
@@ -244,6 +265,8 @@ export function rhsToString(r: RHS): string {
       return `${aexpToString(r.obj)}[${aexpToString(r.keyExpr)}] = ${aexpToString(r.val)}`;
     case "keys":
       return `keys(${aexpToString(r.obj)})`;
+    case "iterElem":
+      return `iterElem(${aexpToString(r.obj)})`;
   }
 }
 
@@ -315,6 +338,7 @@ function fvRHS(r: RHS, acc: Set<Name>): void {
       return;
     case "get":
     case "keys":
+    case "iterElem":
       return fvAExp(r.obj, acc);
     case "put":
       fvAExp(r.obj, acc);

@@ -71,7 +71,7 @@ test("normalize: empty statements are ignored", () => {
 test("normalize rejects out-of-dialect constructs with clear errors", () => {
   const rejects: Array<[string, RegExp]> = [
     [`const f = (x) => x; f(...args);`, /spread/],
-    [`const f = ([a]) => a;`, /destructuring|identifier/],
+    [`const f = ({...r}) => r;`, /object rest/],
     [`a ?? b;`, /logical operator/],
   ];
   for (const [src, re] of rejects) {

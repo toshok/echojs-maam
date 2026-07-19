@@ -31,6 +31,8 @@ function concreteResult(src: string): unknown[] {
           return "<closure>";
         case "obj":
           return "<object>";
+        case "top":
+          return "⊤";
       }
     })
     .sort();

@@ -41,9 +41,10 @@ test("a bare throw aborts the program (no result value)", () => {
   assert.deepEqual(results(`let x = 1; throw x; 42;`), []);
 });
 
-test("the caught value is conservatively approximated (undefined)", () => {
-  // We do not track thrown values, so the catch binding is treated as unknown.
-  assert.deepEqual(results(`let x = 0; try { throw 1; } catch (e) { x = typeof e; } x;`), ["undefined"]);
+test("the caught value is conservatively approximated (\u22a4)", () => {
+  // We do not track thrown values, so the catch binding is \u22a4 \u2014 any value
+  // may be thrown (`undefined` here would be a wrong type fact).
+  assert.deepEqual(results(`let x = 0; try { throw 1; } catch (e) { x = typeof e; } x;`), ["top"]);
 });
 
 test("try without catch: the finalizer still runs before the rest", () => {
@@ -76,10 +77,12 @@ test("export default of an expression is accepted", () => {
   assert.deepEqual(results(`const v = 41; export default v + 1; 7;`), [7]);
 });
 
-test("import bindings are accepted (degraded to undefined)", () => {
-  // Multi-module linking is future work; imported names read as undefined.
+test("import bindings are accepted (degraded to \u22a4)", () => {
+  // Multi-module linking is future work; an imported name is a real value we
+  // know nothing about, so it reads as \u22a4 (not `undefined` \u2014 that would be a
+  // wrong *type* fact, poisoning anything typed downstream).
   const src = `import { thing } from "somewhere"; typeof thing;`;
-  assert.deepEqual(results(src), ["undefined"]);
+  assert.deepEqual(results(src), ["top"]);
 });
 
 test("module syntax normalizes without error", () => {

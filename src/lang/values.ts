@@ -25,6 +25,7 @@ import type { TypeSig } from "./shapes.js";
 const TAG_ORDER = ["num", "str", "bool", "null", "undefined", "fn", "obj"] as const;
 
 function renderTags(tags: ReadonlySet<string>): TypeSig {
+  if (tags.has("⊤")) return "⊤"; // top absorbs every other tag
   if (tags.size === 0) return "never";
   const present = TAG_ORDER.filter((t) => tags.has(t));
   return present.join("|");
@@ -42,6 +43,17 @@ export interface ValDomain<Ctx, D> {
 
   /** `int-I`/`clo-I` introductions. */
   lit(l: Lit): D;
+  /**
+   * `⊤` — "any value, no information".  The degradation element: unknown-call
+   * results, unmodeled imports, and unmodeled iteration bind this instead of
+   * a made-up `undefined`.  One canonical value (join-absorbing), so degraded
+   * bindings never multiply the state space.  `elimClo`/`elimObj` on ⊤ are
+   * empty (its closures/objects cannot be enumerated) — call and property-walk
+   * sites must check {@link isTop} and take their degrade paths.
+   */
+  readonly top: D;
+  /** Is `d` (at least) the ⊤ element — i.e. may it be *any* value? */
+  isTop(d: D): boolean;
   /**
    * The `⊤` of the string type — "any string". Used to enumerate an object's
    * *unknown* keys (array indices under `for-in`). Unrepresentable in the concrete
@@ -89,7 +101,12 @@ export interface ValDomain<Ctx, D> {
 // Concrete domain:  D = ℘(CVal)
 // ===========================================================================
 
-/** A concrete value. */
+/**
+ * A concrete value.  `top` is the degradation element: it appears only when
+ * an analysis over the concrete domain hits an unmodeled construct (an unknown
+ * call, an unmodeled import) — a run that produced a `top` is not an exact
+ * evaluation and is excluded from differential comparisons anyway.
+ */
 export type CVal<Ctx> =
   | { readonly t: "num"; readonly v: number }
   | { readonly t: "bool"; readonly v: boolean }
@@ -97,7 +114,8 @@ export type CVal<Ctx> =
   | { readonly t: "null" }
   | { readonly t: "undef" }
   | { readonly t: "clo"; readonly c: Closure<Ctx> }
-  | { readonly t: "obj"; readonly addr: OAddr<Ctx> };
+  | { readonly t: "obj"; readonly addr: OAddr<Ctx> }
+  | { readonly t: "top" };
 
 function cvalKey<Ctx>(closureK: Keyable<Closure<Ctx>>, oaddrK: Keyable<OAddr<Ctx>>): Keyable<CVal<Ctx>> {
   return {
@@ -117,6 +135,8 @@ function cvalKey<Ctx>(closureK: Keyable<Closure<Ctx>>, oaddrK: Keyable<OAddr<Ctx
           return `c:${closureK.key(v.c)}`;
         case "obj":
           return `o:${oaddrK.key(v.addr)}`;
+        case "top":
+          return "⊤";
       }
     },
   };
@@ -136,10 +156,14 @@ function truthyC<Ctx>(v: CVal<Ctx>): boolean {
     case "clo":
     case "obj":
       return true;
+    case "top":
+      return true; // never asked: elimBool special-cases ⊤ to {true, false}
   }
 }
 
 function applyBinC<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
+  // A ⊤ operand poisons the result — the concrete domain has no partial tops.
+  if (a.t === "top" || b.t === "top") return { t: "top" };
   const num = (x: CVal<Ctx>): number =>
     x.t === "num" ? x.v : x.t === "bool" ? (x.v ? 1 : 0) : x.t === "str" ? Number(x.v) : NaN;
   switch (op) {
@@ -197,6 +221,7 @@ function applyBinC<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
 }
 
 function applyUnC<Ctx>(op: UnOp, a: CVal<Ctx>): CVal<Ctx> {
+  if (a.t === "top") return op === "void" ? { t: "undef" } : { t: "top" };
   const num = (x: CVal<Ctx>): number =>
     x.t === "num" ? x.v : x.t === "bool" ? (x.v ? 1 : 0) : x.t === "str" ? Number(x.v) : x.t === "null" ? 0 : NaN;
   switch (op) {
@@ -212,6 +237,8 @@ function applyUnC<Ctx>(op: UnOp, a: CVal<Ctx>): CVal<Ctx> {
       return { t: "str", v: cvalTypeof(a) };
     case "void":
       return { t: "undef" };
+    case "toStr":
+      return { t: "str", v: cvalToJs(a) };
   }
 }
 
@@ -250,6 +277,8 @@ function cvalStrictEq<Ctx>(a: CVal<Ctx>, b: CVal<Ctx>): boolean {
         a.addr.time.every((x, i) => x === bo.addr.time[i])
       );
     }
+    case "top":
+      return false; // unreachable: applyBinC short-circuits ⊤ operands
   }
 }
 
@@ -269,6 +298,8 @@ function cvalToJs<Ctx>(a: CVal<Ctx>): string {
       return "function";
     case "obj":
       return "[object Object]";
+    case "top":
+      return "⊤"; // unreachable: callers short-circuit ⊤ operands
   }
 }
 
@@ -288,6 +319,8 @@ function cvalTypeof<Ctx>(a: CVal<Ctx>): string {
       return "function";
     case "obj":
       return "object";
+    case "top":
+      return "⊤"; // unreachable: applyUnC short-circuits ⊤ operands
   }
 }
 
@@ -298,11 +331,14 @@ export function concreteDomain<Ctx>(
 ): ValDomain<Ctx, FinSet<CVal<Ctx>>> {
   const K = cvalKey(closureK, oaddrK);
   const lattice = powersetLattice(K);
+  const topSet = FinSet.of<CVal<Ctx>>(K, { t: "top" });
   return {
     name: "concrete (℘CVal)",
     lattice,
     key: { key: (s) => `{${[...s].map(K.key).sort().join(",")}}` },
     lit: (l) => FinSet.of(K, litToCVal<Ctx>(l)),
+    top: topSet,
+    isTop: (d) => [...d].some((v) => v.t === "top"),
     // ⊤-typed and intrinsic values are not representable concretely (the concrete
     // interpreter models the standard library by exact evaluation, not summaries).
     topString: () => FinSet.empty<CVal<Ctx>>(K),
@@ -323,7 +359,10 @@ export function concreteDomain<Ctx>(
     },
     elimBool: (d) => {
       let out = FinSet.of<boolean>({ key: String });
-      for (const v of d) out = out.add(truthyC(v));
+      for (const v of d) {
+        if (v.t === "top") out = out.add(true).add(false);
+        else out = out.add(truthyC(v));
+      }
       return out;
     },
     elimClo: (d) => {
@@ -362,6 +401,8 @@ function cvalTag<Ctx>(v: CVal<Ctx>): string {
       return "fn";
     case "obj":
       return "obj";
+    case "top":
+      return "⊤";
   }
 }
 
@@ -377,6 +418,8 @@ function litToCVal<Ctx>(l: Lit): CVal<Ctx> {
       return { t: "null" };
     case "undef":
       return { t: "undef" };
+    case "top":
+      return { t: "top" };
   }
 }
 
@@ -412,6 +455,12 @@ function constSetLattice<A>(K: Keyable<A>, bound: number): JoinSemilattice<Const
 
 /** An abstract value: a component per base type, plus closures and objects. */
 export interface AVal<Ctx> {
+  /**
+   * `⊤` — may be ANY value (the degradation element). When set, every other
+   * component is normalized to bottom, so ⊤ is one canonical value (not a
+   * product) and joins involving it can never grow the state space.
+   */
+  readonly topP: boolean;
   readonly nums: ConstSet<number>;
   readonly strs: ConstSet<string>;
   readonly bools: FinSet<boolean>;
@@ -443,6 +492,7 @@ export function abstractDomain<Ctx>(
   const intrL = powersetLattice(intrK);
 
   const bot: AVal<Ctx> = {
+    topP: false,
     nums: numsL.bot,
     strs: strsL.bot,
     bools: boolsL.bot,
@@ -453,12 +503,18 @@ export function abstractDomain<Ctx>(
     intrinsics: intrL.bot,
   };
 
+  /** The one canonical ⊤ value — every join that involves ⊤ returns exactly this. */
+  const TOP: AVal<Ctx> = { ...bot, topP: true };
+
   const lattice: JoinSemilattice<AVal<Ctx>> = {
     bot,
     // Reference-preserving: every component join returns its left arg on a no-op,
     // so if none changed we return `a` itself — no allocation, and callers get
     // identity-based "did it grow?" for free. This is the hottest join in the run.
     join: (a, b) => {
+      // ⊤ absorbs: the result collapses to the canonical TOP (never a product).
+      if (a.topP) return a;
+      if (b.topP) return TOP;
       const nums = numsL.join(a.nums, b.nums);
       const strs = strsL.join(a.strs, b.strs);
       const bools = boolsL.join(a.bools, b.bools);
@@ -478,22 +534,26 @@ export function abstractDomain<Ctx>(
         undefP === a.undefP
       )
         return a;
-      return { nums, strs, bools, nullP, undefP, clos, objs, intrinsics };
+      return { topP: false, nums, strs, bools, nullP, undefP, clos, objs, intrinsics };
     },
     lte: (a, b) =>
-      numsL.lte(a.nums, b.nums) &&
-      strsL.lte(a.strs, b.strs) &&
-      boolsL.lte(a.bools, b.bools) &&
-      (!a.nullP || b.nullP) &&
-      (!a.undefP || b.undefP) &&
-      closL.lte(a.clos, b.clos) &&
-      objsL.lte(a.objs, b.objs) &&
-      intrL.lte(a.intrinsics, b.intrinsics),
+      b.topP ||
+      (!a.topP &&
+        numsL.lte(a.nums, b.nums) &&
+        strsL.lte(a.strs, b.strs) &&
+        boolsL.lte(a.bools, b.bools) &&
+        (!a.nullP || b.nullP) &&
+        (!a.undefP || b.undefP) &&
+        closL.lte(a.clos, b.clos) &&
+        objsL.lte(a.objs, b.objs) &&
+        intrL.lte(a.intrinsics, b.intrinsics)),
   };
 
   const key: Keyable<AVal<Ctx>> = {
     key: (v) =>
-      [
+      v.topP
+        ? "⊤"
+        : [
         v.nums.top ? "n:⊤" : `n:{${[...v.nums.items].map(numK.key).sort().join(",")}}`,
         v.strs.top ? "s:⊤" : `s:{${[...v.strs.items].map(strK.key).sort().join(",")}}`,
         `b:{${[...v.bools].map(boolK.key).sort().join(",")}}`,
@@ -516,6 +576,25 @@ export function abstractDomain<Ctx>(
     v.nums.top ? "top" : v.nums.items.isEmpty() ? null : v.nums.items.toArray();
 
   const binop = (op: BinOp, l: AVal<Ctx>, r: AVal<Ctx>): AVal<Ctx> => {
+    // A ⊤ operand: refine by what the operator can produce (numeric operators
+    // yield numbers, comparisons yield booleans, …) — sound, and keeps a single
+    // degraded operand from erasing the whole expression's type.
+    if (l.topP || r.topP) {
+      switch (op) {
+        case "-": case "*": case "/": case "%": case "**":
+        case "&": case "|": case "^": case "<<": case ">>": case ">>>":
+          return anyNum;
+        case "<": case "<=": case ">": case ">=":
+        case "===": case "!==": case "==": case "!=":
+        case "instanceof": case "in":
+          return anyBool;
+        case "+":
+          return lattice.join(anyNum, anyStr); // number or string, never anything else
+        case "&&":
+        case "||":
+          return lattice.join(l, r); // one of the operands — ⊤ absorbs
+      }
+    }
     switch (op) {
       case "+": {
         // string if either side can be a string; numeric otherwise
@@ -616,8 +695,12 @@ export function abstractDomain<Ctx>(
           return { ...bot, nullP: true };
         case "undef":
           return { ...bot, undefP: true };
+        case "top":
+          return TOP;
       }
     },
+    top: TOP,
+    isTop: (d) => d.topP,
     topString: () => anyStr,
     anyNum: () => anyNum,
     anyBool: () => anyBool,
@@ -626,6 +709,21 @@ export function abstractDomain<Ctx>(
     intrinsic: (id) => ({ ...bot, intrinsics: FinSet.of(intrK, id) }),
     binop,
     unop: (op, a) => {
+      // ⊤ operand: every unary operator still has a known result type.
+      if (a.topP) {
+        switch (op) {
+          case "-": case "+": case "~":
+            return anyNum;
+          case "!":
+            return anyBool;
+          case "typeof":
+            return anyStr; // typeof of anything is SOME string
+          case "void":
+            return { ...bot, undefP: true };
+          case "toStr":
+            return anyStr;
+        }
+      }
       switch (op) {
         case "-":
           return liftNum2(a, num(0), (x) => -x, num, anyNum);
@@ -635,6 +733,21 @@ export function abstractDomain<Ctx>(
           return liftNum2(a, num(0), (x) => ~(x | 0), num, anyNum);
         case "void":
           return { ...bot, undefP: true };
+        case "toStr": {
+          // The implicit ToString of a template literal: constant-fold what we
+          // can, widen the rest — the result is always ⊆ string.
+          let out = lattice.bot;
+          if (a.nums.top) out = lattice.join(out, anyStr);
+          else for (const n of a.nums.items) out = lattice.join(out, str(String(n)));
+          if (a.strs.top) out = lattice.join(out, anyStr);
+          else for (const s of a.strs.items) out = lattice.join(out, str(s));
+          for (const b of a.bools) out = lattice.join(out, str(String(b)));
+          if (a.nullP) out = lattice.join(out, str("null"));
+          if (a.undefP) out = lattice.join(out, str("undefined"));
+          if (!a.clos.isEmpty() || !a.intrinsics.isEmpty() || !a.objs.isEmpty())
+            out = lattice.join(out, anyStr);
+          return out;
+        }
         case "!": {
           let out = lattice.bot;
           for (const b of elimBoolA(a)) out = lattice.join(out, boolV(!b));
@@ -658,6 +771,7 @@ export function abstractDomain<Ctx>(
     elimObj: (d) => d.objs,
     elimIntrinsic: (d) => d.intrinsics,
     typeSig: (v) => {
+      if (v.topP) return "⊤";
       const tags = new Set<string>();
       if (v.nums.top || !v.nums.items.isEmpty()) tags.add("num");
       if (v.strs.top || !v.strs.items.isEmpty()) tags.add("str");
@@ -673,6 +787,7 @@ export function abstractDomain<Ctx>(
 
   function elimBoolA(v: AVal<Ctx>): FinSet<boolean> {
     let out = FinSet.empty<boolean>({ key: String });
+    if (v.topP) return out.add(true).add(false);
     // numbers: 0/NaN falsy, others truthy; without exact value assume both when non-empty
     if (v.nums.top) out = out.add(true).add(false);
     else

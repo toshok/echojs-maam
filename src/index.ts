@@ -38,7 +38,7 @@ export * from "./lang/values.js";
 export { makeMachine } from "./lang/machine.js";
 export type { ContextStrategy, ControlState, Machine } from "./lang/machine.js";
 export type { Addr, AbsObject, Closure, Env, KAddr, Kont, OAddr, Store } from "./lang/state.js";
-export type { PropName, Shape } from "./lang/shapes.js";
+export type { PropName, Shape, TypeSig } from "./lang/shapes.js";
 export { ShapeTable, shapeToString } from "./lang/shapes.js";
 
 // Analysis entry point

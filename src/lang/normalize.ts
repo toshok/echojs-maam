@@ -95,6 +95,8 @@ export function normalizeProgram(program: Program): {
   lambdaParams: Map<Loc, ReadonlyArray<string>>;
   /** Bindings bound to a degraded value (imprecisely modeled constructs). */
   degradedBindings: ReadonlyArray<DegradedBinding>;
+  /** Source node → core name holding its value (see Normalizer.nodeNames). */
+  nodeNames: ReadonlyMap<Node, Name>;
 } {
   const fresh = new Fresh();
   const n = new Normalizer(fresh);
@@ -119,6 +121,7 @@ export function normalizeProgram(program: Program): {
     retOwner: n.retOwner,
     lambdaParams: n.lambdaParams,
     degradedBindings: n.degradedBindings,
+    nodeNames: n.nodeNames,
   };
 }
 
@@ -139,6 +142,31 @@ class Normalizer {
   readonly lambdaParams = new Map<Loc, ReadonlyArray<string>>();
   /** Bindings bound to a degraded value (imprecisely modeled constructs). */
   readonly degradedBindings: DegradedBinding[] = [];
+  /**
+   * Source node → the core {@link Name} that holds the node's value — the raw
+   * material of the node-identity type oracle (`AnalysisResult.typeOfNode`).
+   *
+   * Mapping policy:
+   *  - an EXPRESSION node maps to the name its value is bound to: the declared
+   *    variable when normalization binds it directly (`normNamed`), otherwise
+   *    the ANF temporary minted for it (`normAtom` — a `var` atom result);
+   *  - a DECLARATION Identifier (variable declarator, parameter, pattern leaf,
+   *    catch param, import specifier local, function name, for-in/for-of loop
+   *    variable, rest target) maps to its alpha-renamed binding;
+   *  - GLUE stays unmapped: plain literals (no binding — but a REGEX literal
+   *    IS mapped: it allocates an object held in a temp), lambda atoms,
+   *    template concat/toStr intermediates, loop/join scaffolding, and
+   *    temporaries internal to intrinsic lowerings;
+   *  - UNBOUND identifier reads (free/global names) are unmapped — they have
+   *    no store binding, and mapping their raw source name could alias a
+   *    fresh-minted core name;
+   *  - a for-in/for-of head that REUSES a pre-declared variable (the `setVar`
+   *    form) maps nothing; only declaration-form heads map the loop variable.
+   * The first mapping for a node wins (a `var x = e` maps `e` to `x`, not to
+   * the temp a nested lowering may also produce). Identity-keyed: the exact
+   * node object, never structural.
+   */
+  readonly nodeNames = new Map<Node, Name>();
   /** The lambda currently being compiled (`TOPLEVEL` at the program level). */
   private currentOwner: Loc = TOPLEVEL;
   /**
@@ -151,6 +179,43 @@ class Normalizer {
   private readonly loopStack: Array<{ onBreak: () => Expr; onContinue: () => Expr }> = [];
 
   constructor(private readonly fresh: Fresh) {}
+
+  /** Nodes spliced into multiple binding sites — poisoned, never reported. */
+  private readonly poisonedNodes = new Set<Node>();
+  /** Nodes whose mapping came from `normNamed` and still owes its inner lowering one alias. */
+  private readonly pendingInitAlias = new Set<Node>();
+
+  /**
+   * Record that `node`'s value is held by core name `name`.
+   *
+   *  - Benign duplicate (same node, same name): first mapping wins.
+   *  - The `normNamed` → `normAtom` ALIAS PAIR is expected: `var y = x` maps
+   *    the initializer node to `y` (fromInit) and its inner lowering then
+   *    reports the read's own name — two correct names for ONE occurrence.
+   *    The init mapping is kept and exactly one such alias is absorbed.
+   *  - Any OTHER different-name remap means a shared node object spliced into
+   *    several sites (EchoJS's `common-ids` singleton identifiers do exactly
+   *    this): any single answer would be silently wrong for the other sites,
+   *    so the node is evicted and POISONED — the oracle reports `undefined`
+   *    and the consumer degrades soundly.
+   */
+  private mapNode(node: Node, name: Name, fromInit = false): void {
+    if (this.poisonedNodes.has(node)) return;
+    const existing = this.nodeNames.get(node);
+    if (existing === undefined) {
+      this.nodeNames.set(node, name);
+      if (fromInit) this.pendingInitAlias.add(node);
+      return;
+    }
+    if (existing === name) return;
+    if (!fromInit && this.pendingInitAlias.has(node)) {
+      this.pendingInitAlias.delete(node); // the one expected alias — absorbed
+      return;
+    }
+    this.nodeNames.delete(node);
+    this.pendingInitAlias.delete(node);
+    this.poisonedNodes.add(node);
+  }
 
   // --- core constructors (each mints a fresh location) ---------------------
 
@@ -199,10 +264,14 @@ class Normalizer {
     const bodyExpr = this.normStmtSeq(rest, scope1, k);
     if (funcs.length === 0) return bodyExpr;
 
-    const bindings = funcs.map((f) => ({
-      name: scope1.get(fnName(f))!,
-      lam: this.compileFunction(f.params, f.body, scope1, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
-    }));
+    const bindings = funcs.map((f) => {
+      const unique = scope1.get(fnName(f))!;
+      if (f.id) this.mapNode(f.id, unique);
+      return {
+        name: unique,
+        lam: this.compileFunction(f.params, f.body, scope1, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
+      };
+    });
     return { tag: "letrec", loc: this.fresh.loc(), bindings, body: bodyExpr };
   }
 
@@ -235,6 +304,7 @@ class Normalizer {
           }
           const src = d.id.name;
           const unique = this.fresh.name(src);
+          this.mapNode(d.id, unique);
           const sc2 = new Map(sc).set(src, unique);
           const cont = go(i + 1, sc2);
           return d.init === null || d.init === undefined
@@ -318,7 +388,9 @@ class Normalizer {
         let sc = scope;
         for (const spec of s.specifiers) {
           const local = spec.local.name;
-          sc = new Map(sc).set(local, this.fresh.name(local));
+          const unique = this.fresh.name(local);
+          this.mapNode(spec.local, unique);
+          sc = new Map(sc).set(local, unique);
           this.degradedBindings.push({
             name: local,
             reason: "unmodeled import — bound to ⊤; cross-module linking is not analyzed",
@@ -388,6 +460,7 @@ class Normalizer {
         if (param.type !== "Identifier")
           throw new NormalizeError("destructuring catch parameters are not supported; use a plain name.");
         paramUnique = this.fresh.name(param.name);
+        this.mapNode(param, paramUnique);
         hScope = new Map(scope).set(param.name, paramUnique);
       }
       let handlerBranch = this.normStmts(handler.body.body, hScope, () => toJoin());
@@ -541,6 +614,7 @@ class Normalizer {
       const id = left.declarations[0]!.id;
       if (id.type !== "Identifier") throw new NormalizeError("`for-in` requires a simple variable name.");
       const unique = this.fresh.name(id.name);
+      this.mapNode(id, unique);
       bodyScope = new Map(scope).set(id.name, unique);
       bindKey = (val, cont) => this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: val }, cont);
     } else if (left.type === "Identifier") {
@@ -593,6 +667,7 @@ class Normalizer {
       const id = left.declarations[0]!.id;
       if (id.type !== "Identifier") throw new NormalizeError("`for-of` requires a simple variable name.");
       const unique = this.fresh.name(id.name);
+      this.mapNode(id, unique); // loop var ↔ the left Identifier node
       bodyScope = new Map(scope).set(id.name, unique);
       bindElem = (val, cont) => this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: val }, cont);
     } else if (left.type === "Identifier") {
@@ -645,6 +720,7 @@ class Normalizer {
 
   /** Bind `name` to the value of `e`, then continue with `cont`. */
   private normNamed(e: EExpr, scope: Scope, name: Name, cont: Expr): Expr {
+    this.mapNode(e, name, /*fromInit*/ true); // the initializer's value lives in the declared name
     switch (e.type) {
       case "CallExpression": {
         const intr = this.tryIntrinsic(e, scope, (a) =>
@@ -695,6 +771,19 @@ class Normalizer {
   // --- expressions (CPS A-normalization to an atomic result) ---------------
 
   normAtom(e: EExpr, scope: Scope, k: (a: AExp) => Expr): Expr {
+    // Central node-mapping hook: whatever the inner lowering produces, if the
+    // node's value ends up in a named atom (a binding read or an ANF temp),
+    // record node → name for the type oracle. Literal/lambda atoms are not
+    // named values; they stay unmapped (see the nodeNames policy block).
+    return this.normAtomInner(e, scope, (a) => {
+      // Unbound identifier reads keep their raw source name in the atom;
+      // mapping those could alias a fresh-minted name — skip them (S2).
+      if (a.tag === "var" && (e.type !== "Identifier" || scope.has(e.name))) this.mapNode(e, a.name);
+      return k(a);
+    });
+  }
+
+  private normAtomInner(e: EExpr, scope: Scope, k: (a: AExp) => Expr): Expr {
     switch (e.type) {
       case "Literal": {
         // A regex literal `/…/` is an opaque `RegExp` object — allocate a fresh
@@ -713,6 +802,7 @@ class Normalizer {
         const self = e.id?.name;
         if (self !== undefined) {
           const selfUnique = this.fresh.name(self);
+          if (e.id) this.mapNode(e.id, selfUnique);
           const inner = new Map(scope).set(self, selfUnique);
           const lam = this.compileFunction(e.params, e.body, inner, { name: self, span: spanOf(e) }, false, e as OldFunctionDialect);
           return {
@@ -1457,13 +1547,27 @@ class Normalizer {
 
     const inner = new Map(scope);
     const srcNames: string[] = [];
+    // EchoJS post-desugar trees keep a trailing `...rest` in `params` as a
+    // RestElement (DesugarDestructuring leaves it in place — EIR lowers it
+    // natively); the old-esprima dialect carries it as the `rest` field
+    // instead. Peel a trailing RestElement off and treat both identically.
+    let positional = params;
+    let restId: Identifier | null = dialect.rest ?? null;
+    const lastParam = params[params.length - 1];
+    if (!restId && lastParam?.type === "RestElement") {
+      if (lastParam.argument.type !== "Identifier")
+        throw new NormalizeError("a rest parameter target must be a plain name.");
+      restId = lastParam.argument;
+      positional = params.slice(0, -1);
+    }
     // A pattern parameter (ObjectPattern/ArrayPattern) becomes a synthetic
     // positional param whose destructuring reads are prologue-wrapped around
     // the body (after the whole-pattern default, matching EIR order).
     const patternParams: Array<{ pattern: Pattern; unique: Name }> = [];
-    const uniqueParams = params.map((p) => {
+    const uniqueParams = positional.map((p) => {
       if (p.type === "Identifier") {
         const u = this.fresh.name(p.name);
+        this.mapNode(p, u);
         inner.set(p.name, u);
         srcNames.push(p.name);
         return u;
@@ -1482,10 +1586,11 @@ class Normalizer {
     // the rest array's *contents* are not modeled: bind it to an array whose
     // element bucket is ⊤ — the right type tag, unknown contents — rather than
     // reject the function, and record the degradation so it is visible.
-    const rest = dialect.rest;
+    const rest = restId;
     let restUnique: Name | null = null;
     if (rest) {
       restUnique = this.fresh.name(rest.name);
+      this.mapNode(rest, restUnique);
       inner.set(rest.name, restUnique);
       this.degradedBindings.push({
         name: rest.name,
@@ -1567,6 +1672,7 @@ class Normalizer {
         const unique = scope.get(pattern.name);
         if (!unique)
           throw new NormalizeError(`internal: pattern name \`${pattern.name}\` was not pre-registered.`);
+        this.mapNode(pattern, unique); // pattern leaf ↔ its Identifier node
         return this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: src }, cont);
       }
       case "AssignmentPattern": {
@@ -1619,6 +1725,7 @@ class Normalizer {
             const unique = scope.get(target.name);
             if (!unique)
               throw new NormalizeError(`internal: pattern name \`${target.name}\` was not pre-registered.`);
+            this.mapNode(target, unique);
             // Bind an array whose elements are the source's per-iteration
             // element approximation (a sound per-element over-approximation
             // of the tail; untracked sources degrade to ⊤ and are counted).

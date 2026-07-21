@@ -14,7 +14,7 @@ import { exploreConfigs, exploreFlowSensitive, exploreGlobal } from "./driver.js
 import type { JoinSemilattice } from "./lattice.js";
 import { flowInsensitiveMonad, pathSensitiveMonad } from "./monad/monads.js";
 import type { TimeDict } from "./time.js";
-import type { Program, Span } from "./lang/ast.js";
+import type { Node, Program, Span } from "./lang/ast.js";
 import type { Expr, Loc, Name } from "./lang/core.js";
 import { computeSiteLayouts, defaultSizeOf, structOf, terminalShapes } from "./layout.js";
 import type { SiteLayout, SizeOf, StructLayout } from "./layout.js";
@@ -254,6 +254,27 @@ export interface AnalysisResult<D> {
   accessorSites(): AccessorSite[];
   /** Diagnostics — polymorphic constructors and heavily-polymorphic functions. */
   warnings(): Warning[];
+  /**
+   * The node-identity type oracle: source node → the {@link TypeSig} of the
+   * value it evaluates to, JOINED over every reached configuration/context.
+   * Keys are the exact node objects fed to {@link analyze} (identity, never
+   * structure); nodes the analysis never reached — dead code, or glue the
+   * normalizer does not map (literals, template intermediates, loop
+   * scaffolding) — are simply absent. Built once, lazily.
+   *
+   * Join semantics: a node mapped to a declared VARIABLE reports the join of
+   * every value that variable ever holds — reassignments included — which may
+   * be strictly wider than what the expression itself produces (`var x = 1+2;
+   * x = "s"` reports "num|str" for the BinaryExpression). Sound (⊒ actual)
+   * for guarded consumption; not a value-at-site reading.
+   */
+  nodeTypes(): ReadonlyMap<Node, TypeSig>;
+  /**
+   * {@link nodeTypes} for one node: its joined TypeSig, or `undefined` for a
+   * never-reached / unmapped / foreign node (fail-soft — never throws;
+   * degradation policy belongs to the consumer).
+   */
+  typeOfNode(n: Node): TypeSig | undefined;
   /** A short human-readable summary. */
   describe(): string;
 }
@@ -267,6 +288,7 @@ export function analyzeCore<D>(
   retOwner?: ReadonlyMap<Loc, Loc>,
   lambdaParams?: ReadonlyMap<Loc, ReadonlyArray<string>>,
   degradedBindings?: ReadonlyArray<DegradedBinding>,
+  nodeNames?: ReadonlyMap<Node, Name>,
 ): AnalysisResult<D> {
   // Build the closure key from `time` so the domain and machine agree on it.
   const ak = addrKey<Loc>(spec.time.key);
@@ -332,6 +354,31 @@ export function analyzeCore<D>(
     }
     return acc;
   };
+
+  // The node-identity type oracle: one pass over every config's value store
+  // joins each core name's bindings; the normalizer's node → name map then
+  // keys those joins by source node. Built once on first query.
+  let nodeTypesCache: Map<Node, TypeSig> | null = null;
+  const nodeTypes = (): ReadonlyMap<Node, TypeSig> => {
+    if (nodeTypesCache) return nodeTypesCache;
+    const byName = new Map<Name, D>();
+    for (const [, store] of collecting.configs) {
+      for (const [addr, v] of store.vals) {
+        const prev = byName.get(addr.name);
+        byName.set(addr.name, prev === undefined ? v : domain.lattice.join(prev, v));
+      }
+    }
+    const out = new Map<Node, TypeSig>();
+    for (const [node, name] of nodeNames ?? []) {
+      const v = byName.get(name);
+      // A name that never got a binding is unreached (dead code): absent, so
+      // `typeOfNode` fail-softs to undefined rather than reporting "never".
+      if (v !== undefined && !domain.isBottom(v)) out.set(node, domain.typeSig(v));
+    }
+    nodeTypesCache = out;
+    return out;
+  };
+  const typeOfNode = (n: Node): TypeSig | undefined => nodeTypes().get(n);
 
   // The heap summary (join of every store) — objects live here.
   const heap = collecting.store.objs;
@@ -488,6 +535,8 @@ export function analyzeCore<D>(
     result,
     domain,
     valueOfVar,
+    nodeTypes,
+    typeOfNode,
     shapesOfValue,
     shapesOfVar: (name) => shapesOfValue(valueOfVar(name)),
     layouts,
@@ -518,6 +567,7 @@ export function analyzeCore<D>(
  */
 export function analyze<D>(program: Program, spec: AnalysisSpec<D>): AnalysisResult<D> {
   assertRestrictions(program);
-  const { core, siteSpans, lambdaInfo, retOwner, lambdaParams, degradedBindings } = normalizeProgram(program);
-  return analyzeCore(core, spec, siteSpans, lambdaInfo, retOwner, lambdaParams, degradedBindings);
+  const { core, siteSpans, lambdaInfo, retOwner, lambdaParams, degradedBindings, nodeNames } =
+    normalizeProgram(program);
+  return analyzeCore(core, spec, siteSpans, lambdaInfo, retOwner, lambdaParams, degradedBindings, nodeNames);
 }

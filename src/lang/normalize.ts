@@ -283,19 +283,29 @@ class Normalizer {
     // work through ordinary scoping and keep the precise fresh-`let` path, so
     // their nodeTypes joins never widen with the pre-binding's `undefined`.
     //
-    // Not modeled, kept VISIBLE instead: `var` hoisting out of NESTED blocks
-    // into this scope when a function here captures the name — those bindings
-    // are recorded as degradedBindings (the harness precondition trips and the
-    // file SKIPs); captured destructuring-pattern leaves and re-declared
-    // (`var x` twice) captures keep the old behavior — Phase 3.5 results note
-    // tracks all of these.
+    // Not modeled, kept VISIBLE instead (degradedBindings — the harness
+    // precondition trips and the file SKIPs): `var` hoisting out of NESTED
+    // blocks into this scope when a function here captures the name, and
+    // destructuring-pattern LEAVES captured at-or-before their declaration
+    // (review R1). Re-declared (`var x` twice) captures ARE modeled: both
+    // declarations assign the one pre-minted binding. Phase 3.5 results note
+    // tracks the rest.
     const listVarDeclIndex = new Map<string, number>();
+    // Destructuring-pattern LEAVES are not modeled by the hoisted-capture
+    // machinery; a leaf captured by a closure created at-or-before its
+    // declaration would be SILENTLY WRONG (the closure's writes miss the
+    // binding), so such leaves are counted as degraded bindings below
+    // (review R1 — the same visibility rationale as the nested-block case).
+    const patternLeafIndex = new Map<string, { j: number; at: Stmt }>();
     rest.forEach((s, j) => {
       if (s.type !== "VariableDeclaration") return;
       for (const d of s.declarations) {
-        if (d.id.type !== "Identifier") continue; // pattern leaves: not modeled (see above)
-        const n = d.id.name;
-        if (!listVarDeclIndex.has(n) && !funcs.some((f) => fnName(f) === n)) listVarDeclIndex.set(n, j);
+        if (d.id.type === "Identifier") {
+          const n = d.id.name;
+          if (!listVarDeclIndex.has(n) && !funcs.some((f) => fnName(f) === n)) listVarDeclIndex.set(n, j);
+        } else if (d.id.type === "ObjectPattern" || d.id.type === "ArrayPattern") {
+          for (const n of patternNames(d.id)) if (!patternLeafIndex.has(n)) patternLeafIndex.set(n, { j, at: s });
+        }
       }
     });
 
@@ -303,7 +313,17 @@ class Normalizer {
     for (const f of funcs) functionSubtreeRefs(f as unknown as AnyNode, hoistedFuncRefs);
 
     const captured = new Set<string>();
-    for (const n of hoistedFuncRefs) if (listVarDeclIndex.has(n)) captured.add(n);
+    const degradedLeaves = new Map<string, Stmt>();
+    const checkPatternLeaf = (n: string, i: number): void => {
+      const pl = patternLeafIndex.get(n);
+      // A name ALSO declared as a plain identifier is handled by the modeled
+      // path; only pattern-only names degrade.
+      if (pl && i <= pl.j && !listVarDeclIndex.has(n)) degradedLeaves.set(n, pl.at);
+    };
+    for (const n of hoistedFuncRefs) {
+      if (listVarDeclIndex.has(n)) captured.add(n);
+      checkPatternLeaf(n, -1);
+    }
     const allFuncRefs = new Set<string>(hoistedFuncRefs);
     rest.forEach((s, i) => {
       const refs = new Set<string>();
@@ -312,8 +332,17 @@ class Normalizer {
         allFuncRefs.add(n);
         const j = listVarDeclIndex.get(n);
         if (j !== undefined && i <= j) captured.add(n);
+        checkPatternLeaf(n, i);
       }
     });
+    for (const [n, at] of degradedLeaves) {
+      this.degradedBindings.push({
+        name: n,
+        reason:
+          "destructuring-pattern binding captured by a closure created at-or-before its declaration — hoisted pattern-leaf capture is not modeled; without this accounting the closure's writes would be silently lost",
+        span: spanOf(at),
+      });
+    }
 
     // Function-scope hoisting we do NOT model: a `var` declared in a nested
     // block whose name a function in this list captures. Count it (visible
@@ -1978,10 +2007,24 @@ function functionSubtreeRefs(root: AnyNode, out: Set<string>): void {
   const visit = (n: AnyNode): void => {
     if (FUNCTION_NODE_TYPES.has(n.type ?? "")) {
       const params = new Set<string>();
-      for (const p of (n["params"] as AnyNode[] | undefined) ?? []) identifierRefs(p, params);
+      // Binding names only (patternNames walks pattern LEAVES — an ES6 default's
+      // right-hand side is an expression, not a binding, and must stay in refs).
+      for (const p of (n["params"] as AnyNode[] | undefined) ?? []) {
+        for (const nm of patternNames(p as unknown as Node)) params.add(nm);
+      }
+      // Old-esprima/echojs dialect: a trailing `rest` identifier is a parameter.
+      const restP = n["rest"] as AnyNode | undefined;
+      if (restP?.type === "Identifier") params.add(restP["name"] as string);
       const refs = new Set<string>();
       const body = n["body"] as AnyNode | undefined;
       if (body && typeof body.type === "string") identifierRefs(body, refs);
+      // Old-esprima/echojs dialect (review R2): `defaults` expressions evaluate
+      // in the function's scope — scan them like the body. Unreachable via
+      // acorn (ES6 defaults are AssignmentPatterns inside `params`, already
+      // covered), but echojs post-desugar trees carry the parallel array.
+      for (const d of (n["defaults"] as (AnyNode | null)[] | undefined) ?? []) {
+        if (d && typeof d.type === "string") identifierRefs(d, refs);
+      }
       for (const r of refs) if (!params.has(r)) out.add(r);
       return;
     }

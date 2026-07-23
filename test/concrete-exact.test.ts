@@ -227,6 +227,42 @@ test("nested-block var captured by a function DEGRADES visibly (review F2)", () 
   );
 });
 
+test("captured destructuring-pattern leaf DEGRADES visibly (review R1)", () => {
+  // `var f = function () { a = 9; }; var [a, b] = [1, 2]; f(); a;` — real JS
+  // says 9; hoisted pattern-leaf capture is not modeled, so without the
+  // accounting the concrete run would answer 1 with ZERO degradation
+  // (silently wrong). The accounting makes the harness precondition trip.
+  const r = analyze(parse(`var f = function () { a = 9; }; var [a, b] = [1, 2]; f(); a;`), concreteEval());
+  assert.ok(r.metrics.degradedBindings > 0, "pattern-leaf capture must count as a degraded binding");
+  assert.ok(
+    r.warnings().some((w) => w.kind === "degraded-binding" && w.message.includes("pattern")),
+    "and surface as a degraded-binding warning",
+  );
+  // Declare-then-capture pattern leaves work through ordinary scoping and
+  // must NOT degrade.
+  const ok = analyze(parse(`var [a, b] = [1, 2]; var f = function () { a = 9; }; f(); a;`), concreteEval());
+  assert.equal(ok.metrics.degradedBindings, 0, "declare-then-capture pattern leaf is fine");
+});
+
+test("dialect `defaults` closures participate in the capture scan (review R2)", () => {
+  // echojs post-desugar trees carry old-esprima `defaults` (a parallel array,
+  // NOT ES6 AssignmentPatterns — acorn cannot produce this shape). A closure
+  // inside a default expression that writes a later same-scope var must be
+  // detected by the capture scan; pre-fix its write was silently dropped.
+  const prog = parse(`function t(p) { return p(); } var n = 0; var r = t(); r + n;`);
+  const fnExpr = (parse(`(function () { n = 7; return 1; });`).body[0] as unknown as { expression: unknown })
+    .expression;
+  (prog.body[0] as unknown as { defaults: unknown[] }).defaults = [fnExpr];
+  const r = analyze(prog, spec());
+  assert.equal(r.metrics.unknownCalls, 0);
+  assert.equal(r.metrics.degradedBindings, 0);
+  assert.deepEqual(
+    [...(r.result as FinSet<CVal<Loc>>)],
+    [{ t: "num", v: 8 }],
+    "default-closure write must reach the later var (1 + 7)",
+  );
+});
+
 test("bare NaN / Infinity identifiers are dialect literals, not unbound reads", () => {
   const nan = runPlain(`NaN;`);
   assert.equal(nan.values.length, 1, "NaN must evaluate, not kill the path");

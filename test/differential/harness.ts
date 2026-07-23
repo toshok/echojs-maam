@@ -33,10 +33,12 @@
  *    the layout `buck-test-stage.sh` assembles). Unset ⇒ the lane is SKIPPED
  *    LOUDLY, never silently (standalone maam clones / maam CI).
  *    Root-caused echojs bugs this lane has found live in
- *    `ejs-known-divergences.json`: listed files report `KNOWN` without
- *    failing the gate, an UNLISTED divergence fails it, and a listed file
- *    that stops diverging fails it as STALE — the list can only shrink by
- *    fixing echojs, never rot.
+ *    `ejs-known-divergences.json` (structured entries: symptom + rootCause,
+ *    enforced): listed files report `KNOWN` without failing the gate, an
+ *    UNLISTED divergence fails it, and a listed file that stops diverging
+ *    fails it as STALE — the list can only shrink by fixing echojs, never
+ *    rot. An entry whose file cannot be validated at all (compiles N/A, is
+ *    skipped, or is missing from the corpus) is warned about by name.
  *
  * 3. **containment** — for every file the concrete run handles, and every
  *    source node BOTH the concrete and an abstract run map (the concrete
@@ -246,7 +248,7 @@ interface FileResult {
   file: string;
   status: "PASS" | "PASS-CONTAINS" | "SKIP" | "DIVERGE" | "CONFIG-FAIL";
   detail: string;
-  ejs: "OK" | "N/A" | "DIVERGE" | "KNOWN" | "STALE-KNOWN" | "off" | "-";
+  ejs: "OK" | "N/A" | "N/A-KNOWN" | "DIVERGE" | "KNOWN" | "STALE-KNOWN" | "off" | "-";
   containChecked: number;
   containAbstractMissing: number;
   containViolations: string[];
@@ -361,10 +363,19 @@ function main(): number {
     .sort();
   const ejs = setupEjsLane();
   const ejsEnabled = !("disabled" in ejs);
-  const knownEjsDivergences: Record<string, string> = JSON.parse(
+  const knownRaw: Record<string, unknown> = JSON.parse(
     fs.readFileSync(path.join(HERE, "ejs-known-divergences.json"), "utf8"),
   );
-  delete (knownEjsDivergences as Record<string, unknown>)["//"];
+  delete knownRaw["//"];
+  const knownEjsDivergences = new Map<string, { symptom: string; rootCause: string }>();
+  for (const [f, entry] of Object.entries(knownRaw)) {
+    const e = entry as { symptom?: unknown; rootCause?: unknown };
+    if (typeof e?.symptom !== "string" || typeof e?.rootCause !== "string") {
+      console.log(`GATE FAIL: malformed ejs-known-divergences.json entry for ${f} (symptom + rootCause required)`);
+      return 1;
+    }
+    knownEjsDivergences.set(f, { symptom: e.symptom, rootCause: e.rootCause });
+  }
 
   console.log(`differential harness: ${files.length} corpus files, node ${process.version}`);
   if ("disabled" in ejs) console.log(`ejs lane: SKIPPED — ${ejs.disabled}`);
@@ -471,10 +482,21 @@ function main(): number {
         ],
         { cwd: lane.workDir, encoding: "utf8", timeout: TIMEOUT_MS, env: lane.env },
       );
+      const known = knownEjsDivergences.get(file);
       if (compile.status !== 0) {
         r.ejs = "N/A";
         const firstErr = (compile.stderr ?? "").split("\n").find((l) => l.trim() !== "") ?? "compile failed";
         r.detail += ` [ejs N/A: ${firstErr.slice(0, 120)}]`;
+        if (known !== undefined) {
+          // Review F4: a known-divergence entry for a file that no longer
+          // COMPILES cannot be validated in either direction (the claim is
+          // about run behavior). A warning rather than a hard failure —
+          // hard-failing would let compile-subset drift (an esprima gap) flip
+          // a gate about semantics — but it is counted and printed so the
+          // entry cannot rot silently.
+          r.ejs = "N/A-KNOWN";
+          r.detail += " [WARNING: listed in ejs-known-divergences.json but N/A — entry unvalidatable, investigate]";
+        }
       } else {
         const exeRun = spawnSync(path.join(lane.workDir, `${file}.exe`), [], {
           cwd: lane.workDir,
@@ -482,14 +504,13 @@ function main(): number {
           timeout: TIMEOUT_MS,
           env: lane.env,
         });
-        const known = knownEjsDivergences[file];
         if (exeRun.status !== 0 || exeRun.stdout !== nodeRun.stdout) {
           if (known !== undefined) {
             // A root-caused, tracked echojs bug (ejs-known-divergences.json):
             // reported loudly, does not fail the gate. Removing the echojs bug
             // makes this entry STALE, which DOES fail the gate.
             r.ejs = "KNOWN";
-            r.detail += ` [ejs known-divergence: ${known.split(".")[0]}]`;
+            r.detail += ` [ejs known-divergence: ${known.rootCause.split(".")[0]}]`;
           } else {
             r.ejs = "DIVERGE";
             r.detail += ` [ejs: exit=${exeRun.status} stdout=${JSON.stringify(exeRun.stdout ?? "")} vs node ${JSON.stringify(nodeRun.stdout)}]`;
@@ -528,10 +549,19 @@ function main(): number {
   const diverged = count("DIVERGE");
   const configFailed = count("CONFIG-FAIL");
   const ejsOk = results.filter((r) => r.ejs === "OK");
-  const ejsNa = results.filter((r) => r.ejs === "N/A");
+  const ejsNa = results.filter((r) => r.ejs === "N/A" || r.ejs === "N/A-KNOWN");
   const ejsDiv = results.filter((r) => r.ejs === "DIVERGE");
   const ejsKnown = results.filter((r) => r.ejs === "KNOWN");
   const ejsStale = results.filter((r) => r.ejs === "STALE-KNOWN");
+  // Review F4: every known-divergences entry must be accounted for — validated
+  // (KNOWN/STALE), or explicitly reported unvalidatable (its file compiled N/A,
+  // was skipped concrete-side, or is missing from the corpus entirely).
+  const ejsUnvalidatable = ejsEnabled
+    ? [...knownEjsDivergences.keys()].filter((f) => {
+        const res = results.find((x) => x.file === f);
+        return !res || (res.ejs !== "KNOWN" && res.ejs !== "STALE-KNOWN" && res.ejs !== "DIVERGE" && res.ejs !== "OK");
+      })
+    : [];
   const containChecked = results.reduce((a, r) => a + r.containChecked, 0);
   const containMissing = results.reduce((a, r) => a + r.containAbstractMissing, 0);
   const containViolations = results.flatMap((r) => r.containViolations);
@@ -547,6 +577,12 @@ function main(): number {
       ? `ejs lane: ok ${ejsOk.length}  n/a ${ejsNa.length}  known-divergent ${ejsKnown.length} (tracked echojs bugs, see ejs-known-divergences.json)  new-divergent ${ejsDiv.length}  stale-known ${ejsStale.length}`
       : "ejs lane: skipped (see reason above)",
   );
+  if (ejsUnvalidatable.length > 0) {
+    console.log(
+      `WARNING: ${ejsUnvalidatable.length} known-divergence entr${ejsUnvalidatable.length === 1 ? "y" : "ies"} could not be validated ` +
+        `(file N/A, skipped, or missing from corpus): ${ejsUnvalidatable.join(" ")} — investigate; entries must not rot`,
+    );
+  }
   console.log(
     `containment: ${containChecked} node checks across 2 abstract configs, ` +
       `${containMissing} concrete-mapped nodes unmapped abstractly, ${containViolations.length} violations`,

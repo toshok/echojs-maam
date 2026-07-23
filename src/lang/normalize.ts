@@ -38,7 +38,7 @@ import { spanOf } from "./ast.js";
 /** A top-level item: an ordinary statement or an ES module declaration. */
 type Stmt = Statement | ModuleDeclaration;
 import type { AExp, BinOp, Expr, Lit, Loc, Name, RHS, UnOp } from "./core.js";
-import { Fresh, freeVarsOfLam, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
+import { Fresh, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
 
 export class NormalizeError extends Error {
   constructor(message: string) {
@@ -261,41 +261,92 @@ class Normalizer {
       scope1 = m;
     }
 
-    if (funcs.length === 0) return this.normStmtSeq(rest, scope1, k);
-
-    // JS hoisting (differential-harness finding): a hoisted function's body may
-    // reference `var`/`let` bindings DECLARED LATER in the same list — compiling
-    // it against `scope1` alone left those names un-renamed, so the closure's
-    // reads/writes silently missed the real binding (writes were dropped: an
-    // oracle unsoundness, e.g. `var n = 0; function s(){ n = "x"; } s(); n`
-    // reported num). Model the hoisted binding faithfully for the names a
-    // function actually captures: mint their uniques up front, compile the
-    // function bodies against the full scope, pre-bind the captured ones to
-    // `undefined` ABOVE the letrec (so the closures capture the address), and
-    // have their declaration statements ASSIGN (`setVar`) instead of re-binding
-    // (a re-`let` after a call/loop would mint a different address under the
+    // JS hoisting (differential-harness finding, extended per adversarial
+    // review): a closure created textually AT OR BEFORE a variable's
+    // declaration in the same list — a hoisted function declaration, or a
+    // function expression / arrow / object-literal method in an earlier (or
+    // the same) statement — may reference that variable. Compiling it against
+    // the incremental scope left the name un-renamed, so the closure's
+    // reads/writes silently missed the real binding (writes were DROPPED: an
+    // oracle unsoundness, e.g. `var f = function () { n = "x"; }; var n = 0;
+    // f(); n;` reported num). Model the hoisted binding faithfully: detect
+    // capture with a syntactic, over-approximate scan (functionSubtreeRefs),
+    // mint the captured names' uniques up front, pre-bind them to `undefined`
+    // ABOVE everything (so closures capture the address), and have their
+    // declaration statements ASSIGN (`setVar`) instead of re-binding (a
+    // re-`let` after a call/loop would mint a different address under the
     // machine's (name, time) addressing and split the variable).
     //
-    // Scoped deliberately: same-list Identifier declarators only. `var` hoisting
-    // OUT OF nested blocks and captured destructuring-pattern leaves are not
-    // modeled (they keep the old behavior); the Phase 3.5 results note tracks
-    // both. Non-captured names keep today's fresh-`let` path — their nodeTypes
-    // joins never widen with the pre-binding's `undefined`.
-    const listVarNames: string[] = [];
-    for (const s of rest) {
-      if (s.type !== "VariableDeclaration") continue;
+    // Positional: a name declared at statement j takes the hoisted path only
+    // if some function subtree at statement i ≤ j (hoisted declarations count
+    // as i = −1) references it. Declare-then-capture shapes (i > j) already
+    // work through ordinary scoping and keep the precise fresh-`let` path, so
+    // their nodeTypes joins never widen with the pre-binding's `undefined`.
+    //
+    // Not modeled, kept VISIBLE instead: `var` hoisting out of NESTED blocks
+    // into this scope when a function here captures the name — those bindings
+    // are recorded as degradedBindings (the harness precondition trips and the
+    // file SKIPs); captured destructuring-pattern leaves and re-declared
+    // (`var x` twice) captures keep the old behavior — Phase 3.5 results note
+    // tracks all of these.
+    const listVarDeclIndex = new Map<string, number>();
+    rest.forEach((s, j) => {
+      if (s.type !== "VariableDeclaration") return;
       for (const d of s.declarations) {
         if (d.id.type !== "Identifier") continue; // pattern leaves: not modeled (see above)
         const n = d.id.name;
-        if (!listVarNames.includes(n) && !funcs.some((f) => fnName(f) === n)) listVarNames.push(n);
+        if (!listVarDeclIndex.has(n) && !funcs.some((f) => fnName(f) === n)) listVarDeclIndex.set(n, j);
+      }
+    });
+
+    const hoistedFuncRefs = new Set<string>();
+    for (const f of funcs) functionSubtreeRefs(f as unknown as AnyNode, hoistedFuncRefs);
+
+    const captured = new Set<string>();
+    for (const n of hoistedFuncRefs) if (listVarDeclIndex.has(n)) captured.add(n);
+    const allFuncRefs = new Set<string>(hoistedFuncRefs);
+    rest.forEach((s, i) => {
+      const refs = new Set<string>();
+      functionSubtreeRefs(s as unknown as AnyNode, refs);
+      for (const n of refs) {
+        allFuncRefs.add(n);
+        const j = listVarDeclIndex.get(n);
+        if (j !== undefined && i <= j) captured.add(n);
+      }
+    });
+
+    // Function-scope hoisting we do NOT model: a `var` declared in a nested
+    // block whose name a function in this list captures. Count it (visible
+    // degradation — the differential harness's skip precondition), instead of
+    // silently computing on a ⊥ binding.
+    if (allFuncRefs.size > 0) {
+      const nested = new Map<string, AnyNode>();
+      for (const s of rest) {
+        if (s.type === "VariableDeclaration") continue; // list-level: modeled above
+        nestedVarNames(s as unknown as AnyNode, nested);
+      }
+      for (const [n, at] of nested) {
+        if (allFuncRefs.has(n) && !listVarDeclIndex.has(n)) {
+          this.degradedBindings.push({
+            name: n,
+            reason:
+              "nested-block `var` captured by a function in the enclosing scope — function-scope hoisting out of blocks is not modeled; the binding reads as ⊥",
+            span: spanOf(at as unknown as Node),
+          });
+        }
       }
     }
-    const varUniques = new Map<string, Name>();
-    const scopeFull = new Map(scope1);
-    for (const n of listVarNames) {
-      const u = this.fresh.name(n);
-      varUniques.set(n, u);
-      scopeFull.set(n, u);
+
+    if (funcs.length === 0 && captured.size === 0) return this.normStmtSeq(rest, scope1, k);
+
+    const hoisted = new Map<string, Name>();
+    const scopeBody = new Map(scope1);
+    for (const [src] of listVarDeclIndex) {
+      if (captured.has(src)) {
+        const u = this.fresh.name(src);
+        hoisted.set(src, u);
+        scopeBody.set(src, u);
+      }
     }
 
     const bindings = funcs.map((f) => {
@@ -303,23 +354,13 @@ class Normalizer {
       if (f.id) this.mapNode(f.id, unique);
       return {
         name: unique,
-        lam: this.compileFunction(f.params, f.body, scopeFull, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
+        lam: this.compileFunction(f.params, f.body, scopeBody, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
       };
     });
 
-    const capturedUniques = new Set<Name>();
-    for (const b of bindings) if (b.lam.tag === "lam") for (const n of freeVarsOfLam(b.lam)) capturedUniques.add(n);
-    const hoisted = new Map<string, Name>();
-    const scopeBody = new Map(scope1);
-    for (const [src, u] of varUniques) {
-      if (capturedUniques.has(u)) {
-        hoisted.set(src, u);
-        scopeBody.set(src, u);
-      }
-    }
-
     const bodyExpr = this.normStmtSeq(rest, scopeBody, k, hoisted.size > 0 ? hoisted : undefined);
-    let out: Expr = { tag: "letrec", loc: this.fresh.loc(), bindings, body: bodyExpr };
+    let out: Expr =
+      funcs.length > 0 ? { tag: "letrec", loc: this.fresh.loc(), bindings, body: bodyExpr } : bodyExpr;
     for (const u of [...hoisted.values()].reverse()) {
       out = this.letE(u, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litUndef) }, out);
     }
@@ -1877,6 +1918,97 @@ function propKeyNameSafe(key: Node): string | null {
  * decomposes the pattern. Unsupported leaves are ignored here; `bindPattern`
  * rejects them with a precise error when it reaches them.
  */
+// --- syntactic hoisting scan (see normStmts) --------------------------------
+//
+// A deliberately cheap, OVER-approximate ESTree walk: it answers "might this
+// statement list's later-declared variable be referenced from inside a closure
+// created at or before its declaration?" — the shape whose writes the machine
+// would otherwise silently drop. Over-approximation only costs precision (the
+// captured name's nodeTypes join widens with the hoisted pre-binding's
+// `undefined`), never soundness.
+
+type AnyNode = { readonly type?: string } & Record<string, unknown>;
+
+const FUNCTION_NODE_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+
+/** Recurse into every ESTree child of `n` (arrays and single nodes). */
+function walkChildren(n: AnyNode, visit: (c: AnyNode) => void): void {
+  for (const key of Object.keys(n)) {
+    if (key === "loc" || key === "range") continue;
+    const v = n[key];
+    if (Array.isArray(v)) {
+      for (const c of v) if (c && typeof c === "object" && typeof (c as AnyNode).type === "string") visit(c as AnyNode);
+    } else if (v && typeof v === "object" && typeof (v as AnyNode).type === "string") {
+      visit(v as AnyNode);
+    }
+  }
+}
+
+/** Every identifier NAME referenced under `root`, excluding non-computed member
+ * properties and non-computed object keys (field names, not variable refs). */
+function identifierRefs(root: AnyNode, out: Set<string>): void {
+  const visit = (n: AnyNode): void => {
+    if (n.type === "Identifier") {
+      out.add(n["name"] as string);
+      return;
+    }
+    if (n.type === "MemberExpression" && !n["computed"]) {
+      const obj = n["object"] as AnyNode | undefined;
+      if (obj && typeof obj.type === "string") visit(obj);
+      return;
+    }
+    if (n.type === "Property" && !n["computed"]) {
+      const val = n["value"] as AnyNode | undefined;
+      if (val && typeof val.type === "string") visit(val);
+      return;
+    }
+    walkChildren(n, visit);
+  };
+  visit(root);
+}
+
+/**
+ * For each function-creating subtree within `root` (function declarations and
+ * expressions, arrows — object-literal methods are FunctionExpressions), add
+ * every identifier referenced inside it to `out`, minus that function's own
+ * parameter names (a cheap shadow filter; inner locals/params of NESTED
+ * functions are not filtered — over-approximate by design).
+ */
+function functionSubtreeRefs(root: AnyNode, out: Set<string>): void {
+  const visit = (n: AnyNode): void => {
+    if (FUNCTION_NODE_TYPES.has(n.type ?? "")) {
+      const params = new Set<string>();
+      for (const p of (n["params"] as AnyNode[] | undefined) ?? []) identifierRefs(p, params);
+      const refs = new Set<string>();
+      const body = n["body"] as AnyNode | undefined;
+      if (body && typeof body.type === "string") identifierRefs(body, refs);
+      for (const r of refs) if (!params.has(r)) out.add(r);
+      return;
+    }
+    walkChildren(n, visit);
+  };
+  visit(root);
+}
+
+/** `var`-kind declaration names in NESTED positions under `root` (inside
+ * blocks/ifs/loops/for-heads — not inside nested functions, whose vars belong
+ * to their own scope). Used for the visible-degradation accounting of
+ * unmodeled function-scope hoisting. */
+function nestedVarNames(root: AnyNode, out: Map<string, AnyNode>): void {
+  const visit = (n: AnyNode): void => {
+    if (FUNCTION_NODE_TYPES.has(n.type ?? "")) return;
+    if (n.type === "VariableDeclaration" && n["kind"] === "var") {
+      for (const d of (n["declarations"] as AnyNode[] | undefined) ?? []) {
+        const id = d["id"] as AnyNode | undefined;
+        if (id?.type === "Identifier" && !out.has(id["name"] as string)) out.set(id["name"] as string, n);
+      }
+      return;
+    }
+    walkChildren(n, visit);
+  };
+  visit(root);
+}
+
 function patternNames(p: Node): string[] {
   const out: string[] = [];
   const walkP = (n: Node | null | undefined): void => {

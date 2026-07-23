@@ -95,7 +95,25 @@ export interface ValDomain<Ctx, D> {
 
   /** Is this the empty value (a stuck / unreachable result)? */
   isBottom(d: D): boolean;
+
+  /**
+   * EXACT concretization — the capability that separates a *reference
+   * interpreter* from an *analysis*.  When defined, `concretize(d)` returns the
+   * single primitive JS value `d` denotes (boxed, so `undefined` is
+   * distinguishable from "not concretizable"), or `null` when `d` is not a
+   * singleton primitive (⊥, a set of several values, ⊤, a closure, an object
+   * reference).  The machine uses its presence as the *exactness contract*:
+   * a domain that defines it demands exact standard-library evaluation — a
+   * modeled intrinsic call either computes its real JS result from fully
+   * concretized inputs or **degrades visibly** (`unknownCalls`), never applies
+   * a summary transfer function.  The concrete domain defines it; the abstract
+   * domain leaves it undefined and keeps the sound summaries.
+   */
+  concretize?(d: D): { readonly v: Prim } | null;
 }
+
+/** The primitive JS values exact intrinsic evaluation traffics in. */
+export type Prim = number | string | boolean | null | undefined;
 
 // ===========================================================================
 // Concrete domain:  D = ℘(CVal)
@@ -115,6 +133,10 @@ export type CVal<Ctx> =
   | { readonly t: "undef" }
   | { readonly t: "clo"; readonly c: Closure<Ctx> }
   | { readonly t: "obj"; readonly addr: OAddr<Ctx> }
+  /** A modeled standard-library intrinsic (`Math.floor`, `parseInt`, …) — a
+   * callable value, so seeded globals are representable concretely and the
+   * machine's exact-evaluation path can dispatch on the id. */
+  | { readonly t: "intr"; readonly id: string }
   | { readonly t: "top" };
 
 function cvalKey<Ctx>(closureK: Keyable<Closure<Ctx>>, oaddrK: Keyable<OAddr<Ctx>>): Keyable<CVal<Ctx>> {
@@ -122,7 +144,9 @@ function cvalKey<Ctx>(closureK: Keyable<Closure<Ctx>>, oaddrK: Keyable<OAddr<Ctx
     key: (v) => {
       switch (v.t) {
         case "num":
-          return `n:${Number.isFinite(v.v) ? v.v : `#${v.v}`}`;
+          // `String(-0)` is `"0"`: key −0 distinctly so a set holding both zeros
+          // does not silently drop one (exactness, not just soundness).
+          return `n:${Number.isFinite(v.v) ? (Object.is(v.v, -0) ? "-0" : v.v) : `#${v.v}`}`;
         case "bool":
           return `b:${v.v}`;
         case "str":
@@ -135,6 +159,8 @@ function cvalKey<Ctx>(closureK: Keyable<Closure<Ctx>>, oaddrK: Keyable<OAddr<Ctx
           return `c:${closureK.key(v.c)}`;
         case "obj":
           return `o:${oaddrK.key(v.addr)}`;
+        case "intr":
+          return `i:${v.id}`;
         case "top":
           return "⊤";
       }
@@ -155,6 +181,7 @@ function truthyC<Ctx>(v: CVal<Ctx>): boolean {
       return false;
     case "clo":
     case "obj":
+    case "intr":
       return true;
     case "top":
       return true; // never asked: elimBool special-cases ⊤ to {true, false}
@@ -164,8 +191,15 @@ function truthyC<Ctx>(v: CVal<Ctx>): boolean {
 function applyBinC<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
   // A ⊤ operand poisons the result — the concrete domain has no partial tops.
   if (a.t === "top" || b.t === "top") return { t: "top" };
+  // ToNumber (differential-harness finding): `null` coerces to 0, not NaN —
+  // `1 + null` is 1 in JS. `undefined` (and uncoercible values) stay NaN.
   const num = (x: CVal<Ctx>): number =>
-    x.t === "num" ? x.v : x.t === "bool" ? (x.v ? 1 : 0) : x.t === "str" ? Number(x.v) : NaN;
+    x.t === "num" ? x.v : x.t === "bool" ? (x.v ? 1 : 0) : x.t === "str" ? Number(x.v) : x.t === "null" ? 0 : NaN;
+  // JS relational comparison: when BOTH operands are strings the comparison is
+  // lexicographic (`"a" < "b"` is true); numeric coercion otherwise
+  // (differential-harness finding: the numeric-only version said false).
+  const cmp = (lt: (x: number | string, y: number | string) => boolean): CVal<Ctx> =>
+    a.t === "str" && b.t === "str" ? { t: "bool", v: lt(a.v, b.v) } : { t: "bool", v: lt(num(a), num(b)) };
   switch (op) {
     case "+":
       // JS string-or-numeric addition
@@ -180,13 +214,13 @@ function applyBinC<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
     case "%":
       return { t: "num", v: num(a) % num(b) };
     case "<":
-      return { t: "bool", v: num(a) < num(b) };
+      return cmp((x, y) => x < y);
     case "<=":
-      return { t: "bool", v: num(a) <= num(b) };
+      return cmp((x, y) => x <= y);
     case ">":
-      return { t: "bool", v: num(a) > num(b) };
+      return cmp((x, y) => x > y);
     case ">=":
-      return { t: "bool", v: num(a) >= num(b) };
+      return cmp((x, y) => x >= y);
     case "**":
       return { t: "num", v: num(a) ** num(b) };
     case "===":
@@ -269,6 +303,8 @@ function cvalStrictEq<Ctx>(a: CVal<Ctx>, b: CVal<Ctx>): boolean {
       return true;
     case "clo":
       return a.c === (b as typeof a).c;
+    case "intr":
+      return a.id === (b as typeof a).id; // one seeded value per id — identity coincides with the id
     case "obj": {
       const bo = b as typeof a;
       return (
@@ -296,6 +332,9 @@ function cvalToJs<Ctx>(a: CVal<Ctx>): string {
       return "undefined";
     case "clo":
       return "function";
+    case "intr":
+      // Native functions stringify as `function <name>() { [native code] }`.
+      return `function ${a.id.split(".").pop()}() { [native code] }`;
     case "obj":
       return "[object Object]";
     case "top":
@@ -316,6 +355,7 @@ function cvalTypeof<Ctx>(a: CVal<Ctx>): string {
     case "null":
       return "object";
     case "clo":
+    case "intr":
       return "function";
     case "obj":
       return "object";
@@ -339,14 +379,14 @@ export function concreteDomain<Ctx>(
     lit: (l) => FinSet.of(K, litToCVal<Ctx>(l)),
     top: topSet,
     isTop: (d) => [...d].some((v) => v.t === "top"),
-    // ⊤-typed and intrinsic values are not representable concretely (the concrete
-    // interpreter models the standard library by exact evaluation, not summaries).
+    // ⊤-typed values are not representable concretely (the concrete interpreter
+    // models the standard library by exact evaluation, not summaries).
     topString: () => FinSet.empty<CVal<Ctx>>(K),
     anyNum: () => FinSet.empty<CVal<Ctx>>(K),
     anyBool: () => FinSet.empty<CVal<Ctx>>(K),
     clo: (c) => FinSet.of<CVal<Ctx>>(K, { t: "clo", c }),
     objRef: (addr) => FinSet.of<CVal<Ctx>>(K, { t: "obj", addr }),
-    intrinsic: () => FinSet.empty<CVal<Ctx>>(K),
+    intrinsic: (id) => FinSet.of<CVal<Ctx>>(K, { t: "intr", id }),
     binop: (op, l, r) => {
       let out = FinSet.empty<CVal<Ctx>>(K);
       for (const a of l) for (const b of r) out = out.add(applyBinC(op, a, b));
@@ -375,13 +415,37 @@ export function concreteDomain<Ctx>(
       for (const v of d) if (v.t === "obj") out = out.add(v.addr);
       return out;
     },
-    elimIntrinsic: () => FinSet.empty<string>({ key: (s) => s }),
+    elimIntrinsic: (d) => {
+      let out = FinSet.empty<string>({ key: (s) => s });
+      for (const v of d) if (v.t === "intr") out = out.add(v.id);
+      return out;
+    },
     typeSig: (d) => {
       const tags = new Set<string>();
       for (const v of d) tags.add(cvalTag(v));
       return renderTags(tags);
     },
     isBottom: (d) => d.isEmpty(),
+    concretize: (d) => {
+      const items = d.toArray();
+      if (items.length !== 1) return null;
+      const v = items[0]!;
+      switch (v.t) {
+        case "num":
+        case "bool":
+        case "str":
+          return { v: v.v };
+        case "null":
+          return { v: null };
+        case "undef":
+          return { v: undefined };
+        case "clo":
+        case "obj":
+        case "intr":
+        case "top":
+          return null;
+      }
+    },
   };
 }
 
@@ -398,6 +462,7 @@ function cvalTag<Ctx>(v: CVal<Ctx>): string {
     case "undef":
       return "undefined";
     case "clo":
+    case "intr":
       return "fn";
     case "obj":
       return "obj";

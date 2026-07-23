@@ -22,6 +22,7 @@
     "build:cjs": "tsc -p tsconfig.cjs.json && node -e \"require('node:fs').writeFileSync('dist/cjs/package.json', JSON.stringify({ type: 'commonjs' }) + '\\n')\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/**/*.test.ts",
+    "diff-harness": "node --import tsx test/differential/harness.ts",
     "demo": "node --import tsx examples/demo.ts",
     "bench": "node --import tsx examples/bench.ts"
   },

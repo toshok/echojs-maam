@@ -40,6 +40,8 @@ function showConcrete(r: AnalysisResult<FinSet<CVal<Loc>>>): string {
         return "<closure>";
       case "obj":
         return "<object>";
+      case "intr":
+        return `<intrinsic ${v.id}>`;
       case "top":
         return "⊤";
     }

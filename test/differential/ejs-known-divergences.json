@@ -1,0 +1,19 @@
+{
+  "//": [
+    "echojs-vs-node divergences the ejs lane FOUND and root-caused (2026-07-23,",
+    "echojs eir work tree, stage0 node-hosted compiler). Each is a pre-existing",
+    "echojs runtime/compiler bug, verified by minimal standalone probes — not a",
+    "maam machine bug (the concrete-vs-node lane is green on every one of these",
+    "files). They are recorded here so the lane stays honest: a listed file that",
+    "STOPS diverging fails the gate as stale (remove it when echojs is fixed),",
+    "and any divergence NOT listed fails the gate outright. Tracked in echojs",
+    "docs/maam-p0-results.md 'Phase 3.5'."
+  ],
+  "arith-coercion.js": "echojs runtime aborts on `1 + null`: ejsval ToNumber(ejsval) at runtime/ejs-ops.c:260 'not implemented' (exit 134). JS: null coerces to 0.",
+  "arith-intops.js": "`-8 >>> 28` is 0 under echojs, 15 under node — ToUint32 on a negative shift operand is wrong/unimplemented.",
+  "arith-negzero.js": "`-0 === 0` is false under echojs (NaN-boxed bit comparison; JS strict equality must treat the zeros as equal). 1/-0 = -Infinity is correct, so it is the comparison, not -0 production.",
+  "compare-numbers.js": "same root cause as arith-negzero.js: `-0 === 0` strict-equality bug.",
+  "math-statics.js": "`Math.round(-2.5)` is -3 under echojs (C round(): half away from zero), -2 under JS (half toward +Infinity).",
+  "strings-number-render.js": "`Number(\"  7  \")` is NaN under echojs — ToNumber(string) does not trim whitespace; JS requires it (7).",
+  "typeof-table.js": "`typeof null` is \"null\" under echojs; the spec requires \"object\"."
+}

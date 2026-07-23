@@ -38,7 +38,7 @@ import { spanOf } from "./ast.js";
 /** A top-level item: an ordinary statement or an ES module declaration. */
 type Stmt = Statement | ModuleDeclaration;
 import type { AExp, BinOp, Expr, Lit, Loc, Name, RHS, UnOp } from "./core.js";
-import { Fresh, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
+import { Fresh, freeVarsOfLam, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
 
 export class NormalizeError extends Error {
   constructor(message: string) {
@@ -261,27 +261,78 @@ class Normalizer {
       scope1 = m;
     }
 
-    const bodyExpr = this.normStmtSeq(rest, scope1, k);
-    if (funcs.length === 0) return bodyExpr;
+    if (funcs.length === 0) return this.normStmtSeq(rest, scope1, k);
+
+    // JS hoisting (differential-harness finding): a hoisted function's body may
+    // reference `var`/`let` bindings DECLARED LATER in the same list — compiling
+    // it against `scope1` alone left those names un-renamed, so the closure's
+    // reads/writes silently missed the real binding (writes were dropped: an
+    // oracle unsoundness, e.g. `var n = 0; function s(){ n = "x"; } s(); n`
+    // reported num). Model the hoisted binding faithfully for the names a
+    // function actually captures: mint their uniques up front, compile the
+    // function bodies against the full scope, pre-bind the captured ones to
+    // `undefined` ABOVE the letrec (so the closures capture the address), and
+    // have their declaration statements ASSIGN (`setVar`) instead of re-binding
+    // (a re-`let` after a call/loop would mint a different address under the
+    // machine's (name, time) addressing and split the variable).
+    //
+    // Scoped deliberately: same-list Identifier declarators only. `var` hoisting
+    // OUT OF nested blocks and captured destructuring-pattern leaves are not
+    // modeled (they keep the old behavior); the Phase 3.5 results note tracks
+    // both. Non-captured names keep today's fresh-`let` path — their nodeTypes
+    // joins never widen with the pre-binding's `undefined`.
+    const listVarNames: string[] = [];
+    for (const s of rest) {
+      if (s.type !== "VariableDeclaration") continue;
+      for (const d of s.declarations) {
+        if (d.id.type !== "Identifier") continue; // pattern leaves: not modeled (see above)
+        const n = d.id.name;
+        if (!listVarNames.includes(n) && !funcs.some((f) => fnName(f) === n)) listVarNames.push(n);
+      }
+    }
+    const varUniques = new Map<string, Name>();
+    const scopeFull = new Map(scope1);
+    for (const n of listVarNames) {
+      const u = this.fresh.name(n);
+      varUniques.set(n, u);
+      scopeFull.set(n, u);
+    }
 
     const bindings = funcs.map((f) => {
       const unique = scope1.get(fnName(f))!;
       if (f.id) this.mapNode(f.id, unique);
       return {
         name: unique,
-        lam: this.compileFunction(f.params, f.body, scope1, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
+        lam: this.compileFunction(f.params, f.body, scopeFull, { name: fnName(f), span: spanOf(f) }, false, f as OldFunctionDialect),
       };
     });
-    return { tag: "letrec", loc: this.fresh.loc(), bindings, body: bodyExpr };
+
+    const capturedUniques = new Set<Name>();
+    for (const b of bindings) if (b.lam.tag === "lam") for (const n of freeVarsOfLam(b.lam)) capturedUniques.add(n);
+    const hoisted = new Map<string, Name>();
+    const scopeBody = new Map(scope1);
+    for (const [src, u] of varUniques) {
+      if (capturedUniques.has(u)) {
+        hoisted.set(src, u);
+        scopeBody.set(src, u);
+      }
+    }
+
+    const bodyExpr = this.normStmtSeq(rest, scopeBody, k, hoisted.size > 0 ? hoisted : undefined);
+    let out: Expr = { tag: "letrec", loc: this.fresh.loc(), bindings, body: bodyExpr };
+    for (const u of [...hoisted.values()].reverse()) {
+      out = this.letE(u, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litUndef) }, out);
+    }
+    return out;
   }
 
-  private normStmtSeq(stmts: ReadonlyArray<Stmt>, scope: Scope, k: (scope: Scope) => Expr): Expr {
+  private normStmtSeq(stmts: ReadonlyArray<Stmt>, scope: Scope, k: (scope: Scope) => Expr, hoisted?: ReadonlyMap<string, Name>): Expr {
     if (stmts.length === 0) return k(scope);
     const [head, ...tail] = stmts;
-    return this.normStmt(head!, scope, (scope2) => this.normStmtSeq(tail, scope2, k));
+    return this.normStmt(head!, scope, (scope2) => this.normStmtSeq(tail, scope2, k, hoisted), hoisted);
   }
 
-  private normStmt(s: Stmt, scope: Scope, k: (scope: Scope) => Expr): Expr {
+  private normStmt(s: Stmt, scope: Scope, k: (scope: Scope) => Expr, hoisted?: ReadonlyMap<string, Name>): Expr {
     switch (s.type) {
       case "VariableDeclaration": {
         // `const a = …, b = …;` ⇒ sequential bindings, left to right.
@@ -303,6 +354,22 @@ class Normalizer {
             return this.normNamed(d.init, sc, tmp, this.bindPattern(d.id, this.varA(tmp), sc2, cont));
           }
           const src = d.id.name;
+          // A captured-by-hoisted-function name: its binding was pre-created
+          // above the letrec — this declaration ASSIGNS it (see normStmts).
+          const pre = hoisted?.get(src);
+          if (pre !== undefined) {
+            this.mapNode(d.id, pre);
+            const sc2 = new Map(sc).set(src, pre);
+            const cont = go(i + 1, sc2);
+            if (d.init === null || d.init === undefined) return cont; // already `undefined`
+            const tmp = this.fresh.name(src);
+            return this.normNamed(
+              d.init,
+              sc,
+              tmp,
+              this.letE(this.fresh.name(), { tag: "setVar", loc: this.fresh.loc(), name: pre, val: this.varA(tmp) }, cont),
+            );
+          }
           const unique = this.fresh.name(src);
           this.mapNode(d.id, unique);
           const sc2 = new Map(sc).set(src, unique);
@@ -797,6 +864,10 @@ class Normalizer {
       }
       case "Identifier":
         if (!scope.has(e.name) && e.name === "undefined") return k(this.litA(litUndef));
+        // The global numeric constants are literals in the dialect (differential-
+        // harness finding: an unbound `Infinity` read ⊥ and killed the path).
+        if (!scope.has(e.name) && e.name === "Infinity") return k(this.litA(litNum(Infinity)));
+        if (!scope.has(e.name) && e.name === "NaN") return k(this.litA(litNum(NaN)));
         return k(this.varA(scope.get(e.name) ?? e.name));
       case "FunctionExpression": {
         const self = e.id?.name;

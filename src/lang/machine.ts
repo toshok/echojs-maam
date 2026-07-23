@@ -24,8 +24,8 @@ import type { AnalysisMonad, Comp } from "../monad/monad.js";
 import { mplusAll } from "../monad/monad.js";
 import type { TimeDict, Time } from "../time.js";
 import type { AExp, Expr, Loc, Name, RHS } from "./core.js";
-import { freeVarsOfLam, litNum, litStr, litUndef, thisVarName } from "./core.js";
-import type { ValDomain } from "./values.js";
+import { freeVarsOfLam, litBool, litNull, litNum, litStr, litUndef, thisVarName } from "./core.js";
+import type { Prim, ValDomain } from "./values.js";
 import type { ACount, Addr, AbsObject, Closure, KAddr, Kont, OAddr, Store } from "./state.js";
 import {
   Env,
@@ -555,6 +555,96 @@ export function makeMachine<D>(
   ] as const;
   const higherOrderArray = new Set<string>(HIGHER_ORDER_ARRAY);
 
+  // --- Exact intrinsic evaluation (the differential-oracle contract) ---
+  //
+  // A domain that defines `concretize` (the concrete domain) demands *exact*
+  // standard-library results: summaries like `anyNum()` are unrepresentable
+  // there (⊥), so applying a summary model would silently kill or widen a path.
+  // Under such a domain an intrinsic call either (a) is a **pure function of
+  // primitives** whose inputs all concretize — then we compute the real JS
+  // result and inject it as a literal — or (b) **degrades visibly** through the
+  // unknown-call path (`recordUnknownCall` + ⊤), so `metrics.unknownCalls`
+  // flags the run as non-exact and the differential harness skips the file.
+  // Heap-touching intrinsics (`Array`, `arr.push`, `arr.join`, higher-order
+  // methods) always take (b): the smashed `elements` bucket makes their exact
+  // result unknowable. `Math.random` also takes (b): nondeterminism is never
+  // "exact".
+  const exactMode = domain.concretize !== undefined;
+  /** Pure-primitive intrinsics: exact result = the real JS function applied to
+   * the concretized receiver/arguments. Everything not listed degrades. */
+  const EXACT_PURE_STATICS: Readonly<Record<string, unknown>> = {
+    parseInt, parseFloat, isNaN, isFinite,
+    Number, String, Boolean,
+    "Number.parseInt": Number.parseInt, "Number.parseFloat": Number.parseFloat,
+    "Number.isNaN": Number.isNaN, "Number.isFinite": Number.isFinite,
+    "Number.isInteger": Number.isInteger, "Number.isSafeInteger": Number.isSafeInteger,
+    "String.fromCharCode": String.fromCharCode, "String.fromCodePoint": String.fromCodePoint,
+    // On a *primitive* argument `Array.isArray` is exactly `false`; object
+    // arguments do not concretize, so the true case degrades rather than lies.
+    "Array.isArray": Array.isArray,
+    ...Object.fromEntries(
+      [...intrinsicModels.keys()]
+        .filter((id) => id.startsWith("Math.") && id !== "Math.random")
+        .map((id) => [id, (Math as unknown as Record<string, unknown>)[id.slice("Math.".length)]]),
+    ),
+  };
+  /** `String.prototype.*` models that are pure `(string receiver, primitive
+   * args) → primitive` — everything registered except `split` (returns an
+   * array). `replace`/`replaceAll` with a *function* replacer degrade anyway
+   * (a closure never concretizes). */
+  const exactStringMethod = (id: string): unknown => {
+    if (!id.startsWith("String.prototype.")) return undefined;
+    const m = id.slice("String.prototype.".length);
+    if (m === "split" || !intrinsicModels.has(id)) return undefined;
+    return (String.prototype as unknown as Record<string, unknown>)[m];
+  };
+  const primToLit = (v: Prim): D | null => {
+    switch (typeof v) {
+      case "number":
+        return domain.lit(litNum(v));
+      case "string":
+        return domain.lit(litStr(v));
+      case "boolean":
+        return domain.lit(litBool(v));
+      case "undefined":
+        return domain.lit(litUndef);
+      default:
+        return v === null ? domain.lit(litNull) : null; // non-primitive result: not exact
+    }
+  };
+  /**
+   * Try to evaluate intrinsic `id` exactly: every argument (and, for
+   * `String.prototype.*`, the receiver) must concretize to a primitive, the id
+   * must be in the pure table, and the real JS application must return a
+   * primitive. `null` ⇒ caller must degrade visibly.
+   */
+  const tryExactIntrinsic = (id: string, recv: D | null, argVals: ReadonlyArray<D>): D | null => {
+    const cz = domain.concretize;
+    if (!cz) return null;
+    let recvP: Prim = undefined;
+    let fn: unknown;
+    if (recv !== null) {
+      fn = exactStringMethod(id);
+      const c = cz.call(domain, recv);
+      if (typeof fn !== "function" || !c || typeof c.v !== "string") return null;
+      recvP = c.v;
+    } else {
+      fn = EXACT_PURE_STATICS[id];
+      if (typeof fn !== "function") return null;
+    }
+    const args: Prim[] = [];
+    for (const a of argVals) {
+      const c = cz.call(domain, a);
+      if (!c) return null;
+      args.push(c.v);
+    }
+    try {
+      return primToLit((fn as (this: unknown, ...xs: Prim[]) => Prim).apply(recvP, args));
+    } catch {
+      return null; // a throwing intrinsic (bad `repeat` count, …) is not modeled: degrade
+    }
+  };
+
   /** Allocate a fresh array with the given elements, threading the store. */
   function allocArrayWith(
     elems: D,
@@ -712,11 +802,17 @@ export function makeMachine<D>(
     // intern a chain of intermediate shapes (which would otherwise inflate the
     // shape metric by a fixed ~100). Field *values* are still exact, so reads of
     // `Math.PI` / `arr.push` resolve precisely; only the *shape* is coarsened.
+    // EXCEPT under a concretizing domain: a ⊤ shape "may lack any key", so every
+    // read would join a spurious `undefined` (`Math.PI` ⇒ {π, undefined}) and
+    // exactness dies. There the seeded objects get their precise one-shot shape
+    // (one interned shape per namespace — no transition chain, and the shape
+    // metric is not a measurement artifact for concrete runs).
     const mkObj = (fields: ReadonlyArray<readonly [string, D]>): AbsObject<Ctx, D> => {
       let fmap = FinMap.empty<PropName, D>(propK);
       for (const [k, v] of fields) fmap = fmap.set(k, v);
+      const shape = exactMode ? shapes.fromFields(fields.map(([k, v]) => [k, domain.typeSig(v)] as const)) : shapes.top();
       return {
-        shapes: FinSet.of(shapeKey, shapes.top()),
+        shapes: FinSet.of(shapeKey, shape),
         fields: fmap,
         accessors: FinMap.empty(propK),
         proto: FinSet.empty(oak),
@@ -780,6 +876,8 @@ export function makeMachine<D>(
     }
 
     const roots = domain.elimObj(objVal);
+    // A ⊥ receiver is no value at all — propagate ⊥, never a made-up `undefined`.
+    if (domain.isBottom(objVal)) return DJ.bot;
     // A non-object receiver (with no matching prototype) reads as `undefined`.
     if (roots.isEmpty()) return DJ.lte(result, DJ.bot) ? domain.lit(litUndef) : result;
 
@@ -819,6 +917,12 @@ export function makeMachine<D>(
     // A ⊤ receiver reads as ⊤ (any property, any value); accessor dispatch on it
     // is not enumerable — the data path carries the whole approximation.
     if (domain.isTop(objVal)) return { data: domain.top, sawUndefined: false, getters: DJ.bot, setters: DJ.bot };
+    // A ⊥ receiver is NO value — an unreachable/unbound read, not a real one.
+    // Reporting `undefined` here invented a confident value out of nothing
+    // (differential-harness containment finding: with intrinsics off, `Math.PI`
+    // read as exact `undefined` — a ⊑-direction unsoundness). ⊥ in, ⊥ out: the
+    // path dies, downstream nodes report unreached, consumers fail-soft to ⊤.
+    if (domain.isBottom(objVal)) return { data: DJ.bot, sawUndefined: false, getters: DJ.bot, setters: DJ.bot };
     let data = DJ.bot;
     let getters = DJ.bot;
     let setters = DJ.bot;
@@ -1008,6 +1112,22 @@ export function makeMachine<D>(
     const res = resolveProp(objVal, r.key, store);
     let dataResult = res.data;
     if (res.sawUndefined) dataResult = DJ.join(dataResult, domain.lit(litUndef));
+    // `s.length` on a string primitive (differential-harness finding: it read as
+    // a confident `undefined` — unsound in BOTH domains). NOT gated on the
+    // `intrinsics` knob — string length is core language semantics, and the
+    // echojs oracle config runs intrinsics-off. A possibly-string receiver
+    // contributes its length: the exact number when the receiver concretizes,
+    // `anyNum` otherwise; a receiver that can ONLY be a string drops the bogus
+    // `undefined` entirely.
+    if (r.key === "length") {
+      const tags = domain.typeSig(objVal).split("|");
+      if (tags.includes("str")) {
+        const exactRecv = domain.concretize?.(objVal);
+        const len =
+          exactRecv && typeof exactRecv.v === "string" ? domain.lit(litNum(exactRecv.v.length)) : domain.anyNum();
+        dataResult = tags.length === 1 ? len : DJ.join(dataResult, len);
+      }
+    }
     const getters = domain.elimClo(res.getters);
     if (getters.isEmpty()) {
       return bindAndContinue(M, e.name, dataResult, e.body, c.env, c.kaddr, c.time, store);
@@ -1201,7 +1321,8 @@ export function makeMachine<D>(
                   // string/unknown key may also hit any named field.
                   const numericKey = domain.typeSig(atomEval(r.keyExpr, c.env, store)) === "num";
                   const objV = atomEval(r.obj, c.env, store);
-                  let out = domain.lit(litUndef);
+                  // ⊥ receiver: no value, not "undefined" (cf. resolveProp).
+                  let out = domain.isBottom(objV) ? DJ.bot : domain.lit(litUndef);
                   if (domain.isTop(objV)) out = DJ.join(out, domain.top); // unknown receiver: any value
                   for (const oaddr of domain.elimObj(objV)) {
                     const o = objs.getOr(oaddr, objLat.bot);
@@ -1387,6 +1508,17 @@ export function makeMachine<D>(
                 // array methods can weak-update its `elements` bucket.
                 if (intrinsics)
                   for (const id of domain.elimIntrinsic(methodVal)) {
+                    // Exactness contract: compute the real result or degrade
+                    // visibly — never apply a summary under a concretizing domain.
+                    if (exactMode) {
+                      const ev = tryExactIntrinsic(id, null, argVals);
+                      if (ev !== null) branches.push(degrade(ev, store));
+                      else {
+                        recordUnknownCall(r.loc);
+                        branches.push(degrade(domain.top, store));
+                      }
+                      continue;
+                    }
                     // Higher-order array methods (Phase 3) spawn a real callback call.
                     if (id.startsWith("Array.prototype.")) {
                       const m = id.slice("Array.prototype.".length);
@@ -1406,11 +1538,25 @@ export function makeMachine<D>(
               // methods (`s.charCodeAt`, `s.slice`) are dispatched directly when the
               // receiver may be a string and the key names a modeled method.
               if (intrinsics && domain.typeSig(objVal).split("|").includes("str")) {
-                const model = intrinsicModels.get(`String.prototype.${r.key}`);
-                if (model) {
-                  const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
-                  const eff = model({ args: argVals, recv: objVal, oaddr, objs: store.objs, counts: store.counts });
-                  branches.push(degrade(eff.value, { ...store, objs: eff.objs, counts: eff.counts }));
+                const id = `String.prototype.${r.key}`;
+                if (exactMode) {
+                  // Known method: exact application or visible degradation. An
+                  // unknown key falls through to the branches-empty degrade below.
+                  if (intrinsicModels.has(id)) {
+                    const ev = tryExactIntrinsic(id, objVal, argVals);
+                    if (ev !== null) branches.push(degrade(ev, store));
+                    else {
+                      recordUnknownCall(r.loc);
+                      branches.push(degrade(domain.top, store));
+                    }
+                  }
+                } else {
+                  const model = intrinsicModels.get(id);
+                  if (model) {
+                    const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
+                    const eff = model({ args: argVals, recv: objVal, oaddr, objs: store.objs, counts: store.counts });
+                    branches.push(degrade(eff.value, { ...store, objs: eff.objs, counts: eff.counts }));
+                  }
                 }
               }
               // No resolvable method (receiver isn't a tracked object, or the
@@ -1430,6 +1576,15 @@ export function makeMachine<D>(
             const intrBranches: Array<Comp<ControlState<Ctx>>> = [];
             if (intrinsics) {
               for (const id of domain.elimIntrinsic(fv)) {
+                if (exactMode) {
+                  // Exactness contract: only a pure `call` computes (a `new
+                  // Number(3)` is a wrapper *object*, not the primitive — never
+                  // "exact"); anything else falls through to the unknown-callee
+                  // degrade below (targets is empty for a pure intrinsic).
+                  const ev = r.tag === "call" ? tryExactIntrinsic(id, null, argVals) : null;
+                  if (ev !== null) intrBranches.push(degrade(ev, store));
+                  continue;
+                }
                 const model = intrinsicModels.get(id);
                 if (!model) continue;
                 const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };

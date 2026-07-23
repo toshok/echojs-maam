@@ -244,6 +244,35 @@ test("captured destructuring-pattern leaf DEGRADES visibly (review R1)", () => {
   assert.equal(ok.metrics.degradedBindings, 0, "declare-then-capture pattern leaf is fine");
 });
 
+test("binding-SPLIT re-declarations DEGRADE visibly (round-4 residual)", () => {
+  const db = (src: string): { db: number; msgs: string[] } => {
+    const r = analyze(parse(src), concreteEval());
+    return {
+      db: r.metrics.degradedBindings,
+      msgs: r.warnings().filter((w) => w.kind === "degraded-binding").map((w) => w.message),
+    };
+  };
+  // The reviewer repro: a pattern RE-declaration of a hoisted-captured name —
+  // the closure and identifier declarations share the pre-minted binding, the
+  // pattern fresh-binds and splits it (real JS: 5; unaccounted concrete: 1).
+  const mixed = db(`var f = function () { a = 5; }; var a = 0; var [a] = [1]; f(); a;`);
+  assert.equal(mixed.db, 1, "pattern re-declaration of a hoisted-captured name must count");
+  assert.ok(mixed.msgs.some((m) => m.includes("pattern re-declaration")), "with the split reason");
+  // Same class, identifier-only: a re-declaration AFTER a non-hoisted capture.
+  const idSib = db(`var a = 0; var f = function () { a = 5; }; var a = 1; f(); a;`);
+  assert.equal(idSib.db, 1, "identifier re-declaration after capture must count");
+  assert.ok(idSib.msgs.some((m) => m.includes("identifier re-declaration")), "with the split reason");
+  // Same class, pattern-only re-declaration after capture.
+  assert.equal(db(`var [a] = [1]; var f = function () { a = 9; }; var [a] = [2]; f(); a;`).db, 1);
+  // No false positives: hoisted-captured identifier re-declaration is MODELED
+  // (both declarations assign the pre-minted binding — computes "yx"), and
+  // all-refs-after-all-declarations shapes are consistent.
+  const okRedecl = analyze(parse(`var g = ""; function t() { g = g + "x"; } var g = "y"; t(); g;`), concreteEval());
+  assert.equal(okRedecl.metrics.degradedBindings, 0);
+  assert.deepEqual([...(okRedecl.result as FinSet<CVal<Loc>>)], [{ t: "str", v: "yx" }]);
+  assert.equal(db(`var [a] = [7]; var f = function () { return a; }; f();`).db, 0);
+});
+
 test("dialect `defaults` closures participate in the capture scan (review R2)", () => {
   // echojs post-desugar trees carry old-esprima `defaults` (a parallel array,
   // NOT ES6 AssignmentPatterns — acorn cannot produce this shape). A closure

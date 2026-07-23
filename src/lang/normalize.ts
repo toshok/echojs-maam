@@ -290,59 +290,88 @@ class Normalizer {
     // (review R1). Re-declared (`var x` twice) captures ARE modeled: both
     // declarations assign the one pre-minted binding. Phase 3.5 results note
     // tracks the rest.
-    const listVarDeclIndex = new Map<string, number>();
-    // Destructuring-pattern LEAVES are not modeled by the hoisted-capture
-    // machinery; a leaf captured by a closure created at-or-before its
-    // declaration would be SILENTLY WRONG (the closure's writes miss the
-    // binding), so such leaves are counted as degraded bindings below
-    // (review R1 — the same visibility rationale as the nested-block case).
-    const patternLeafIndex = new Map<string, { j: number; at: Stmt }>();
+    // Per-name declaration records for this list. A name may be declared by
+    // identifier declarators, by destructuring-pattern leaves, or (degenerate
+    // but legal) by both; every closure reference position matters, so record
+    // ALL indexes per kind.
+    type DeclRec = { idxs: number[]; at: Stmt };
+    const idDecls = new Map<string, DeclRec>();
+    const patDecls = new Map<string, DeclRec>();
     rest.forEach((s, j) => {
       if (s.type !== "VariableDeclaration") return;
       for (const d of s.declarations) {
         if (d.id.type === "Identifier") {
           const n = d.id.name;
-          if (!listVarDeclIndex.has(n) && !funcs.some((f) => fnName(f) === n)) listVarDeclIndex.set(n, j);
+          if (funcs.some((f) => fnName(f) === n)) continue;
+          const rec = idDecls.get(n) ?? { idxs: [], at: s };
+          rec.idxs.push(j);
+          idDecls.set(n, rec);
         } else if (d.id.type === "ObjectPattern" || d.id.type === "ArrayPattern") {
-          for (const n of patternNames(d.id)) if (!patternLeafIndex.has(n)) patternLeafIndex.set(n, { j, at: s });
+          for (const n of patternNames(d.id)) {
+            const rec = patDecls.get(n) ?? { idxs: [], at: s };
+            rec.idxs.push(j);
+            patDecls.set(n, rec);
+          }
         }
       }
     });
 
     const hoistedFuncRefs = new Set<string>();
     for (const f of funcs) functionSubtreeRefs(f as unknown as AnyNode, hoistedFuncRefs);
-
-    const captured = new Set<string>();
-    const degradedLeaves = new Map<string, Stmt>();
-    const checkPatternLeaf = (n: string, i: number): void => {
-      const pl = patternLeafIndex.get(n);
-      // A name ALSO declared as a plain identifier is handled by the modeled
-      // path; only pattern-only names degrade.
-      if (pl && i <= pl.j && !listVarDeclIndex.has(n)) degradedLeaves.set(n, pl.at);
-    };
-    for (const n of hoistedFuncRefs) {
-      if (listVarDeclIndex.has(n)) captured.add(n);
-      checkPatternLeaf(n, -1);
-    }
-    const allFuncRefs = new Set<string>(hoistedFuncRefs);
+    // Earliest closure-reference position per name (hoisted declarations count
+    // as −1; `∃ ref ≤ X` ⟺ `min(refs) ≤ X`, so the minimum suffices).
+    const minRef = new Map<string, number>();
+    for (const n of hoistedFuncRefs) minRef.set(n, -1);
     rest.forEach((s, i) => {
       const refs = new Set<string>();
       functionSubtreeRefs(s as unknown as AnyNode, refs);
-      for (const n of refs) {
-        allFuncRefs.add(n);
-        const j = listVarDeclIndex.get(n);
-        if (j !== undefined && i <= j) captured.add(n);
-        checkPatternLeaf(n, i);
-      }
+      for (const n of refs) if (!minRef.has(n)) minRef.set(n, i);
     });
-    for (const [n, at] of degradedLeaves) {
-      this.degradedBindings.push({
-        name: n,
-        reason:
-          "destructuring-pattern binding captured by a closure created at-or-before its declaration — hoisted pattern-leaf capture is not modeled; without this accounting the closure's writes would be silently lost",
-        span: spanOf(at),
-      });
+
+    // The MODELED case: an identifier-declared name whose earliest closure
+    // reference is at-or-before its FIRST declaration takes the pre-bind +
+    // setVar path — correct even under re-declaration (every identifier
+    // declaration assigns the one pre-minted binding).
+    const captured = new Set<string>();
+    for (const [n, i] of minRef) {
+      const id = idDecls.get(n);
+      if (id && i <= id.idxs[0]!) captured.add(n);
     }
+
+    // VISIBLE degradation for the binding-SPLIT shapes the modeled path does
+    // not cover (review R1 + round-4 residual). ACCOUNTING ONLY — binding
+    // behavior is untouched; what is banned is a silent wrong answer. A split
+    // happens whenever some later declaration re-binds a name a closure
+    // already captured:
+    //  - a pattern leaf declared at-or-after a closure reference (bindPattern
+    //    always fresh-binds; the closure writes the older binding);
+    //  - a pattern re-declaration of a hoisted-captured name (the closure and
+    //    the identifier declarations share the pre-minted binding, the
+    //    pattern splits off a fresh one) — the round-4 reviewer repro;
+    //  - an identifier re-declaration AFTER a closure capture that was not
+    //    hoisted-modeled (the closure holds the first binding, the re-`let`
+    //    mints a second) — the same class, identifier-only.
+    // All-refs-after-all-declarations shapes are consistent (the closure sees
+    // the final binding, and so does every later statement): no degradation.
+    for (const [n, i] of minRef) {
+      const id = idDecls.get(n);
+      const pat = patDecls.get(n);
+      if (!id && !pat) continue;
+      const lastIdx = Math.max(id ? id.idxs[id.idxs.length - 1]! : -1, pat ? pat.idxs[pat.idxs.length - 1]! : -1);
+      let reason: string | null = null;
+      if (pat && captured.has(n)) {
+        reason =
+          "destructuring-pattern re-declaration of a hoisted-captured variable splits the binding (the closure and identifier declarations share the pre-minted binding; the pattern fresh-binds) — not modeled; without this accounting the closure's writes would be silently lost";
+      } else if (pat && i <= lastIdx) {
+        reason =
+          "destructuring-pattern binding captured by a closure created at-or-before its declaration — hoisted pattern-leaf capture is not modeled; without this accounting the closure's writes would be silently lost";
+      } else if (!pat && id && !captured.has(n) && i <= lastIdx) {
+        reason =
+          "identifier re-declaration after a closure capture splits the binding (the closure holds the earlier binding; the re-declaration mints a fresh one) — not modeled; without this accounting the closure's writes would be silently lost";
+      }
+      if (reason) this.degradedBindings.push({ name: n, reason, span: spanOf((pat ?? id)!.at) });
+    }
+    const allFuncRefs = new Set<string>(minRef.keys());
 
     // Function-scope hoisting we do NOT model: a `var` declared in a nested
     // block whose name a function in this list captures. Count it (visible
@@ -355,7 +384,7 @@ class Normalizer {
         nestedVarNames(s as unknown as AnyNode, nested);
       }
       for (const [n, at] of nested) {
-        if (allFuncRefs.has(n) && !listVarDeclIndex.has(n)) {
+        if (allFuncRefs.has(n) && !idDecls.has(n) && !patDecls.has(n)) {
           this.degradedBindings.push({
             name: n,
             reason:
@@ -370,7 +399,7 @@ class Normalizer {
 
     const hoisted = new Map<string, Name>();
     const scopeBody = new Map(scope1);
-    for (const [src] of listVarDeclIndex) {
+    for (const [src] of idDecls) {
       if (captured.has(src)) {
         const u = this.fresh.name(src);
         hoisted.set(src, u);

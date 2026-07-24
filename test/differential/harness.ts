@@ -50,6 +50,30 @@
  *    (B) the same + `intrinsics: true` (the summary transfer functions whose
  *    soundness is otherwise only asserted).
  *
+ * 4. **shapes** (echojs docs/shapes-plan.md P4.4 precondition) — two halves:
+ *
+ *    a. *Shape containment*, same worker as lane 3: per allocation site, every
+ *       hidden class the CONCRETE machine's objects pass through (the summary
+ *       heap accumulates intermediates — concrete strong updates replace
+ *       per-store, but the collecting join keeps every program point) must
+ *       have an ABSTRACT witness at the same site: the megamorphic ⊤, or a
+ *       shape with the *same field-name set* and every field's type ⊒ the
+ *       concrete field's type. Interning is order-insensitive on both sides,
+ *       so write order cannot cause false alarms; shape ids are per-run, so
+ *       comparison is structural. `abstract ⊒ concrete`, per site.
+ *
+ *    b. *Shape observables* — corpus files named `shapes-obs-*.js` run ONLY
+ *       the node + ejs lanes (status `OBS`): they exercise shape-sensitive
+ *       semantics the machine deliberately does not model (`Object.keys`
+ *       order, `in` during construction, delete-then-readd enumeration,
+ *       freeze/seal, data→accessor conversion — maam's `delete` is a no-op,
+ *       `Object.keys`/`freeze`/`defineProperty` are unmodeled intrinsics), so
+ *       the machine lanes would SKIP them; what needs validating is the
+ *       echojs *runtime*, against node. When the ejs lane is enabled each obs
+ *       file is compiled TWICE — default flags and `--types` (the compile
+ *       mode whose born-with-shape/slot machinery the lane gates) — and both
+ *       executables must match node's stdout byte for byte.
+ *
  * Preconditions, per file: `metrics.unknownCalls === 0` and
  * `metrics.degradedBindings === 0` — degradation makes the diff meaningless.
  * Violations SKIP with the reason printed (the no-silent-caps discipline; the
@@ -70,8 +94,8 @@ import { fileURLToPath } from "node:url";
 
 import type { Program, Statement } from "estree";
 import { parse } from "../../src/lang/parse.js";
-import { analyze, concreteEval, kCFA } from "../../src/index.js";
-import type { AnalysisResult, AnalysisSpec } from "../../src/index.js";
+import { analyze, concreteEval, kCFA, shapeToString } from "../../src/index.js";
+import type { AnalysisResult, AnalysisSpec, Shape } from "../../src/index.js";
 import type { CVal } from "../../src/lang/values.js";
 import type { FinSet } from "../../src/data/finset.js";
 import type { Loc } from "../../src/lang/core.js";
@@ -246,12 +270,16 @@ function setupEjsLane(): EjsLane | { disabled: string } {
 
 interface FileResult {
   file: string;
-  status: "PASS" | "PASS-CONTAINS" | "SKIP" | "DIVERGE" | "CONFIG-FAIL";
+  /** `OBS`: a `shapes-obs-*.js` file — node/ejs lanes only (see header, lane 4b). */
+  status: "PASS" | "PASS-CONTAINS" | "OBS" | "SKIP" | "DIVERGE" | "CONFIG-FAIL";
   detail: string;
   ejs: "OK" | "N/A" | "N/A-KNOWN" | "DIVERGE" | "KNOWN" | "STALE-KNOWN" | "off" | "-";
   containChecked: number;
   containAbstractMissing: number;
   containViolations: string[];
+  shapeChecked: number;
+  shapeMissing: number;
+  shapeViolations: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +293,18 @@ interface FileResult {
 type WorkerOut =
   | { kind: "skip"; reason: string }
   | { kind: "config-fail"; reason: string }
-  | { kind: "ok"; concreteSet: string[]; containChecked: number; containMissing: number; violations: string[] };
+  | {
+      kind: "ok";
+      concreteSet: string[];
+      containChecked: number;
+      containMissing: number;
+      violations: string[];
+      /** Shapes lane (a): concrete hidden classes checked for an abstract witness. */
+      shapeChecked: number;
+      /** Concrete allocation sites with no abstract heap entry (informational, like containMissing). */
+      shapeMissing: number;
+      shapeViolations: string[];
+    };
 
 // The echojs oracle spec verbatim (lib/eir/oracle.ts) and its intrinsics twin —
 // config B exercises the summary transfer functions whose soundness is
@@ -277,6 +316,49 @@ const abstractSpecs: ReadonlyArray<readonly [string, () => AnalysisSpec<unknown>
     () => kCFA(1, "flow-sensitive", "call-site", 64, false, false, false, 512, false, true) as AnalysisSpec<unknown>,
   ],
 ];
+
+// --- shapes lane (a): per-site shape containment ---------------------------
+// Shape ids are per-run (each analyze() builds its own ShapeTable), so shapes
+// compare structurally. Fields are stored canonicalized (sorted by name) on
+// both sides, so a positional walk is a set comparison.
+
+/** Per allocation site (Loc), every hidden class the run's summary heap holds.
+ * Locs correspond across runs: same parse, same deterministic normalizer. */
+function siteShapes<D>(r: AnalysisResult<D>): Map<Loc, Shape[]> {
+  const out = new Map<Loc, Shape[]>();
+  const seen = new Map<Loc, Set<string>>();
+  for (const [addr, obj] of r.collecting.store.objs) {
+    let arr = out.get(addr.loc);
+    let keys = seen.get(addr.loc);
+    if (!arr) {
+      arr = [];
+      keys = new Set();
+      out.set(addr.loc, arr);
+      seen.set(addr.loc, keys!);
+    }
+    for (const s of obj.shapes) {
+      const k = shapeToString(s);
+      if (!keys!.has(k)) {
+        keys!.add(k);
+        arr.push(s);
+      }
+    }
+  }
+  return out;
+}
+
+/** Does `c` (a concrete hidden class) have a witness among `as`? A witness is
+ * the megamorphic ⊤, or a shape with the same field-NAME set whose every field
+ * type is ⊒ the concrete field's type (canonical order ⇒ positional compare). */
+const shapeWitness = (c: Shape, as: readonly Shape[]): boolean =>
+  as.some((a) => {
+    if (a.megamorphic) return true;
+    if (a.fields.length !== c.fields.length) return false;
+    return c.fields.every((cf, i) => {
+      const af = a.fields[i]!;
+      return af.name === cf.name && sigLeq(cf.type, af.type);
+    });
+  });
 
 function analyzeOne(filePath: string): WorkerOut {
   const src = fs.readFileSync(filePath, "utf8");
@@ -307,8 +389,12 @@ function analyzeOne(filePath: string): WorkerOut {
     containChecked: 0,
     containMissing: 0,
     violations: [],
+    shapeChecked: 0,
+    shapeMissing: 0,
+    shapeViolations: [],
   };
   const cTypes = concrete.nodeTypes();
+  const cShapes = siteShapes(concrete);
   for (const [specName, mkSpec] of abstractSpecs) {
     let abstract: AnalysisResult<unknown>;
     try {
@@ -327,6 +413,26 @@ function analyzeOne(filePath: string): WorkerOut {
       if (!sigLeq(cSig, aSig)) {
         const line = (node as { loc?: { start?: { line?: number } } }).loc?.start?.line;
         out.violations.push(`${specName}: node@line${line ?? "?"} concrete ${cSig} ⋢ abstract ${aSig} (⊑-direction bug)`);
+      }
+    }
+    // Shapes lane (a): every concrete hidden class needs an abstract witness
+    // at its allocation site (see the header — the P4.4 precondition check).
+    const aShapes = siteShapes(abstract);
+    for (const [loc, cs] of cShapes) {
+      const as = aShapes.get(loc);
+      if (as === undefined) {
+        out.shapeMissing++;
+        continue;
+      }
+      for (const s of cs) {
+        if (s.megamorphic) continue; // trivially contained
+        out.shapeChecked++;
+        if (!shapeWitness(s, as)) {
+          out.shapeViolations.push(
+            `${specName}: site@loc${loc} concrete ${shapeToString(s)} has no abstract witness among ` +
+              `{${as.map(shapeToString).join(" ")}} (shape ⊑-direction bug)`,
+          );
+        }
       }
     }
   }
@@ -354,6 +460,43 @@ function runWorker(filePath: string): WorkerOut {
       reason: `analysis worker exited ${res.status} without a result: ${(res.stderr ?? "").split("\n")[0]}`,
     };
   }
+}
+
+/** Compile `wrappedPath` in the ejs tree with `flags` and run the executable.
+ * One shared workDir; sequential harness ⇒ recompiling the same file with
+ * different flags just overwrites the previous .exe. */
+function runEjs(
+  lane: EjsLane,
+  file: string,
+  wrappedPath: string,
+  flags: readonly string[],
+): { kind: "na"; err: string } | { kind: "ran"; exit: number | null; stdout: string } {
+  fs.copyFileSync(wrappedPath, path.join(lane.workDir, file));
+  const compile = spawnSync(
+    process.execPath,
+    [
+      path.join(lane.tree, "lib/generated/ejs-es6.js"),
+      "--srcdir",
+      "--moduledir",
+      "../node-compat",
+      "--moduledir",
+      "../ejs-llvm",
+      ...flags,
+      file,
+    ],
+    { cwd: lane.workDir, encoding: "utf8", timeout: TIMEOUT_MS, env: lane.env },
+  );
+  if (compile.status !== 0) {
+    const firstErr = (compile.stderr ?? "").split("\n").find((l) => l.trim() !== "") ?? "compile failed";
+    return { kind: "na", err: firstErr.slice(0, 120) };
+  }
+  const exeRun = spawnSync(path.join(lane.workDir, `${file}.exe`), [], {
+    cwd: lane.workDir,
+    encoding: "utf8",
+    timeout: TIMEOUT_MS,
+    env: lane.env,
+  });
+  return { kind: "ran", exit: exeRun.status, stdout: exeRun.stdout ?? "" };
 }
 
 function main(): number {
@@ -394,35 +537,47 @@ function main(): number {
       containChecked: 0,
       containAbstractMissing: 0,
       containViolations: [],
+      shapeChecked: 0,
+      shapeMissing: 0,
+      shapeViolations: [],
     };
     results.push(r);
     const src = fs.readFileSync(path.join(CORPUS_DIR, file), "utf8");
+    // Shapes lane (b): observable probes bypass the machine lanes entirely —
+    // they exercise semantics the machine deliberately does not model.
+    const isObs = file.startsWith("shapes-obs-");
 
     // --- concrete + abstract runs (worker subprocess; see analyzeOne) ---
-    const w = runWorker(path.join(CORPUS_DIR, file));
-    if (w.kind === "skip") {
-      r.status = "SKIP";
-      r.detail = w.reason;
-      continue;
-    }
-    if (w.kind === "config-fail") {
-      r.status = "CONFIG-FAIL";
-      r.detail = w.reason;
-      continue;
-    }
-    r.containChecked = w.containChecked;
-    r.containAbstractMissing = w.containMissing;
-    r.containViolations = w.violations;
-    const concreteSet = w.concreteSet;
-    if (concreteSet.length === 0) {
-      r.status = "DIVERGE";
-      r.detail = "concrete result is ⊥ (stuck machine) with no degradation reported";
-      continue;
-    }
-    if (concreteSet.includes("⊤")) {
-      r.status = "DIVERGE";
-      r.detail = "concrete result contains ⊤ although unknownCalls=0 — degradation accounting hole";
-      continue;
+    let concreteSet: string[] | null = null;
+    if (!isObs) {
+      const w = runWorker(path.join(CORPUS_DIR, file));
+      if (w.kind === "skip") {
+        r.status = "SKIP";
+        r.detail = w.reason;
+        continue;
+      }
+      if (w.kind === "config-fail") {
+        r.status = "CONFIG-FAIL";
+        r.detail = w.reason;
+        continue;
+      }
+      r.containChecked = w.containChecked;
+      r.containAbstractMissing = w.containMissing;
+      r.containViolations = w.violations;
+      r.shapeChecked = w.shapeChecked;
+      r.shapeMissing = w.shapeMissing;
+      r.shapeViolations = w.shapeViolations;
+      concreteSet = w.concreteSet;
+      if (concreteSet.length === 0) {
+        r.status = "DIVERGE";
+        r.detail = "concrete result is ⊥ (stuck machine) with no degradation reported";
+        continue;
+      }
+      if (concreteSet.includes("⊤")) {
+        r.status = "DIVERGE";
+        r.detail = "concrete result contains ⊤ although unknownCalls=0 — degradation accounting hole";
+        continue;
+      }
     }
 
     // --- node lane ---
@@ -451,76 +606,68 @@ function main(): number {
       continue;
     }
     const nodeValue = nodeLines[0]!;
-    if (!concreteSet.includes(nodeValue)) {
-      r.status = "DIVERGE";
-      r.detail = `node says ${nodeValue}, concrete set {${concreteSet.join(", ")}}`;
-      continue;
-    }
-    if (concreteSet.length === 1) {
-      r.status = "PASS";
+    if (isObs) {
+      // Shapes lane (b): node is ground truth; the only check is ejs-vs-node.
+      r.status = "OBS";
       r.detail = nodeValue;
     } else {
-      r.status = "PASS-CONTAINS";
-      r.detail = `${nodeValue} ∈ ${concreteSet.length}-value set (machine over-approximation: smashed array elements / nondet catch)`;
+      if (!concreteSet!.includes(nodeValue)) {
+        r.status = "DIVERGE";
+        r.detail = `node says ${nodeValue}, concrete set {${concreteSet!.join(", ")}}`;
+        continue;
+      }
+      if (concreteSet!.length === 1) {
+        r.status = "PASS";
+        r.detail = nodeValue;
+      } else {
+        r.status = "PASS-CONTAINS";
+        r.detail = `${nodeValue} ∈ ${concreteSet!.length}-value set (machine over-approximation: smashed array elements / nondet catch)`;
+      }
     }
 
     // --- ejs lane ---
     if (ejsEnabled) {
       const lane = ejs as EjsLane;
-      const ejsSrc = path.join(lane.workDir, file);
-      fs.copyFileSync(wrappedPath, ejsSrc);
-      const compile = spawnSync(
-        process.execPath,
-        [
-          path.join(lane.tree, "lib/generated/ejs-es6.js"),
-          "--srcdir",
-          "--moduledir",
-          "../node-compat",
-          "--moduledir",
-          "../ejs-llvm",
-          file,
-        ],
-        { cwd: lane.workDir, encoding: "utf8", timeout: TIMEOUT_MS, env: lane.env },
-      );
       const known = knownEjsDivergences.get(file);
-      if (compile.status !== 0) {
-        r.ejs = "N/A";
-        const firstErr = (compile.stderr ?? "").split("\n").find((l) => l.trim() !== "") ?? "compile failed";
-        r.detail += ` [ejs N/A: ${firstErr.slice(0, 120)}]`;
-        if (known !== undefined) {
-          // Review F4: a known-divergence entry for a file that no longer
-          // COMPILES cannot be validated in either direction (the claim is
-          // about run behavior). A warning rather than a hard failure —
-          // hard-failing would let compile-subset drift (an esprima gap) flip
-          // a gate about semantics — but it is counted and printed so the
-          // entry cannot rot silently.
-          r.ejs = "N/A-KNOWN";
-          r.detail += " [WARNING: listed in ejs-known-divergences.json but N/A — entry unvalidatable, investigate]";
+      // Obs files compile twice — default and --types (the mode P4.4's
+      // born-with-shape rides in); both executables must match node.
+      const flagSets: ReadonlyArray<readonly string[]> = isObs ? [[], ["--types"]] : [[]];
+      for (const flags of flagSets) {
+        const tag = flags.length > 0 ? `ejs ${flags.join(" ")}` : "ejs";
+        const run = runEjs(lane, file, wrappedPath, flags);
+        if (run.kind === "na") {
+          r.ejs = "N/A";
+          r.detail += ` [${tag} N/A: ${run.err}]`;
+          if (known !== undefined) {
+            // Review F4: a known-divergence entry for a file that no longer
+            // COMPILES cannot be validated in either direction (the claim is
+            // about run behavior). A warning rather than a hard failure —
+            // hard-failing would let compile-subset drift (an esprima gap) flip
+            // a gate about semantics — but it is counted and printed so the
+            // entry cannot rot silently.
+            r.ejs = "N/A-KNOWN";
+            r.detail += " [WARNING: listed in ejs-known-divergences.json but N/A — entry unvalidatable, investigate]";
+          }
+          break;
         }
-      } else {
-        const exeRun = spawnSync(path.join(lane.workDir, `${file}.exe`), [], {
-          cwd: lane.workDir,
-          encoding: "utf8",
-          timeout: TIMEOUT_MS,
-          env: lane.env,
-        });
-        if (exeRun.status !== 0 || exeRun.stdout !== nodeRun.stdout) {
+        if (run.exit !== 0 || run.stdout !== nodeRun.stdout) {
           if (known !== undefined) {
             // A root-caused, tracked echojs bug (ejs-known-divergences.json):
             // reported loudly, does not fail the gate. Removing the echojs bug
             // makes this entry STALE, which DOES fail the gate.
             r.ejs = "KNOWN";
-            r.detail += ` [ejs known-divergence: ${known.rootCause.split(".")[0]}]`;
+            r.detail += ` [${tag} known-divergence: ${known.rootCause.split(".")[0]}]`;
           } else {
             r.ejs = "DIVERGE";
-            r.detail += ` [ejs: exit=${exeRun.status} stdout=${JSON.stringify(exeRun.stdout ?? "")} vs node ${JSON.stringify(nodeRun.stdout)}]`;
+            r.detail += ` [${tag}: exit=${run.exit} stdout=${JSON.stringify(run.stdout)} vs node ${JSON.stringify(nodeRun.stdout)}]`;
           }
-        } else if (known !== undefined) {
-          r.ejs = "STALE-KNOWN";
-          r.detail += " [ejs matches node but the file is listed in ejs-known-divergences.json — remove the stale entry]";
-        } else {
-          r.ejs = "OK";
+          break;
         }
+        r.ejs = "OK";
+      }
+      if (r.ejs === "OK" && known !== undefined) {
+        r.ejs = "STALE-KNOWN";
+        r.detail += " [ejs matches node but the file is listed in ejs-known-divergences.json — remove the stale entry]";
       }
     }
 
@@ -538,13 +685,21 @@ function main(): number {
         : r.containChecked > 0
           ? ` contain=${r.containChecked}`
           : "";
-    console.log(`${r.file.padEnd(28)} ${r.status.padEnd(13)} ejs=${r.ejs.padEnd(7)}${contain} ${r.detail}`);
+    const shapes =
+      r.shapeViolations.length > 0
+        ? ` SHAPE-FAIL(${r.shapeViolations.length})`
+        : r.shapeChecked > 0
+          ? ` shapes=${r.shapeChecked}`
+          : "";
+    console.log(`${r.file.padEnd(28)} ${r.status.padEnd(13)} ejs=${r.ejs.padEnd(7)}${contain}${shapes} ${r.detail}`);
     for (const v of r.containViolations) console.log(`    ${v}`);
+    for (const v of r.shapeViolations) console.log(`    ${v}`);
   }
 
   const count = (s: FileResult["status"]): FileResult[] => results.filter((r) => r.status === s);
   const passed = count("PASS");
   const contained = count("PASS-CONTAINS");
+  const obs = count("OBS");
   const skipped = count("SKIP");
   const diverged = count("DIVERGE");
   const configFailed = count("CONFIG-FAIL");
@@ -565,10 +720,13 @@ function main(): number {
   const containChecked = results.reduce((a, r) => a + r.containChecked, 0);
   const containMissing = results.reduce((a, r) => a + r.containAbstractMissing, 0);
   const containViolations = results.flatMap((r) => r.containViolations);
+  const shapeChecked = results.reduce((a, r) => a + r.shapeChecked, 0);
+  const shapeMissing = results.reduce((a, r) => a + r.shapeMissing, 0);
+  const shapeViolations = results.flatMap((r) => r.shapeViolations);
 
   console.log("\n==== differential harness summary ====");
   console.log(
-    `corpus: ${results.length}  exact: ${passed.length}  contains: ${contained.length}  ` +
+    `corpus: ${results.length}  exact: ${passed.length}  contains: ${contained.length}  obs: ${obs.length}  ` +
       `skipped: ${skipped.length}  diverged: ${diverged.length}  config-failed: ${configFailed.length}`,
   );
   if (skipped.length > 0) console.log(`skips (visible, with reasons above): ${skipped.map((r) => r.file).join(" ")}`);
@@ -587,6 +745,11 @@ function main(): number {
     `containment: ${containChecked} node checks across 2 abstract configs, ` +
       `${containMissing} concrete-mapped nodes unmapped abstractly, ${containViolations.length} violations`,
   );
+  console.log(
+    `shapes: ${shapeChecked} concrete-class witness checks across 2 abstract configs, ` +
+      `${shapeMissing} concrete sites unmapped abstractly, ${shapeViolations.length} violations; ` +
+      `${obs.length} observable probes (node ground truth${ejsEnabled ? ", ejs default + --types" : ", ejs lane off"})`,
+  );
 
   if (diverged.length > 0 || configFailed.length > 0) {
     console.log(`GATE FAIL: divergences=${diverged.length} config-failures=${configFailed.length}`);
@@ -594,6 +757,10 @@ function main(): number {
   }
   if (containViolations.length > 0) {
     console.log(`GATE FAIL: ${containViolations.length} containment violations`);
+    exit = 1;
+  }
+  if (shapeViolations.length > 0) {
+    console.log(`GATE FAIL: ${shapeViolations.length} shape-containment violations`);
     exit = 1;
   }
   if (ejsEnabled && ejsDiv.length > 0) {
@@ -613,8 +780,20 @@ function main(): number {
     console.log("GATE FAIL: zero containment checks — vacuous pass");
     exit = 1;
   }
+  if (shapeChecked === 0) {
+    console.log("GATE FAIL: zero shape-containment checks — vacuous pass");
+    exit = 1;
+  }
+  if (obs.length === 0) {
+    console.log("GATE FAIL: zero shape-observable probes compared against node — vacuous pass");
+    exit = 1;
+  }
   if (ejsEnabled && ejsOk.length === 0) {
     console.log("GATE FAIL: ejs lane enabled but covered zero files — vacuous pass");
+    exit = 1;
+  }
+  if (ejsEnabled && !obs.some((r) => r.ejs === "OK")) {
+    console.log("GATE FAIL: ejs lane enabled but zero shape-observable probes covered — vacuous pass");
     exit = 1;
   }
   if (exit === 0) console.log("GATE PASS: zero divergences");

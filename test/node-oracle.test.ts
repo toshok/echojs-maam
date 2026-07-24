@@ -223,3 +223,61 @@ test("positional params before a RestElement still bind positionally", () => {
   const r = run(prog);
   assert.equal(r.domain.typeSig(r.valueOfVar("a")), "num");
 });
+
+// --- receiver shapes (echojs shapes-plan P4.3) -------------------------------
+
+test("receiverShapesOfNode: a literal receiver reports one terminal shape with its ordered witness", () => {
+  const recv = id("p"); // the object node of `p.x`
+  const member = { type: "MemberExpression", object: recv, property: id("x"), computed: false };
+  const prog = program([
+    varDecl("p", objLit([["x", lit(1)], ["y", lit(2)]])),
+    varDecl("s", member),
+    exprStmt(id("s")),
+  ]);
+  const r = run(prog);
+  const shapes = r.receiverShapesOfNode(recv as unknown as Node);
+  assert.ok(shapes && shapes.length === 1, "one terminal shape");
+  const s = shapes![0]!;
+  assert.deepEqual(
+    [...s.fields].map((f) => `${f.name}:${f.type}`).sort(),
+    ["x:num", "y:num"]
+  );
+  assert.deepEqual(r.fieldOrderOfShape(s), ["x", "y"]);
+});
+
+test("receiverShapesOfNode: construction intermediates are subsumed to the terminal", () => {
+  const recv = id("q");
+  const member = { type: "MemberExpression", object: recv, property: id("b"), computed: false };
+  const prog = program([
+    varDecl("q", objLit([["a", lit(1)]])),
+    // q.b = 2 — the receiver passes through {a} then settles at {a, b}
+    exprStmt({
+      type: "AssignmentExpression",
+      operator: "=",
+      left: { type: "MemberExpression", object: id("q"), property: id("b"), computed: false },
+      right: lit(2),
+    }),
+    varDecl("t", member),
+    exprStmt(id("t")),
+  ]);
+  const r = run(prog);
+  const shapes = r.receiverShapesOfNode(recv as unknown as Node);
+  assert.ok(shapes && shapes.length === 1, "intermediates subsumed");
+  assert.equal(shapes![0]!.fields.length, 2);
+  assert.deepEqual(r.fieldOrderOfShape(shapes![0]!), ["a", "b"]);
+});
+
+test("receiverShapesOfNode: a foreign node fail-softs to undefined", () => {
+  const prog = program([varDecl("p", objLit([["x", lit(1)]])), exprStmt(id("p"))]);
+  const r = run(prog);
+  assert.equal(r.receiverShapesOfNode(id("nowhere") as unknown as Node), undefined);
+});
+
+test("fieldOrderOfShape: the megamorphic top shape has no ordered witness", () => {
+  const prog = program([varDecl("p", objLit([["x", lit(1)]])), exprStmt(id("p"))]);
+  const r = run(prog);
+  const top = r.shapesOfVar; // silence unused-var pattern; query ⊤ via the table below
+  void top;
+  // build ⊤ indirectly: any shape with megamorphic=true reports undefined
+  assert.equal(r.fieldOrderOfShape({ id: -1, fields: [], megamorphic: true }), undefined);
+});

@@ -275,6 +275,23 @@ export interface AnalysisResult<D> {
    * degradation policy belongs to the consumer).
    */
   typeOfNode(n: Node): TypeSig | undefined;
+  /**
+   * Node-identity receiver-shape query (echojs shapes-plan P4.3): the
+   * TERMINAL hidden classes the value of `n` (typically a property access's
+   * object node) may point to, joined over every reached configuration —
+   * construction intermediates are subsumed away exactly as in
+   * {@link layouts}. `undefined` for an unmapped/never-reached node (the
+   * node-identity fail-soft); `[]` for a node whose value points at no
+   * analyzed object. Guarded consumers need the join, not a per-site value.
+   */
+  receiverShapesOfNode(n: Node): Shape[] | undefined;
+  /**
+   * The ordered witness for a shape: its field names in the insertion order
+   * of the first transition path that interned it (see
+   * `ShapeTable.insertionOrderOf`), or `undefined` for the megamorphic ⊤.
+   * An order-sensitive runtime (echojs) interns its guard shapes from this.
+   */
+  fieldOrderOfShape(s: Shape): readonly string[] | undefined;
   /** A short human-readable summary. */
   describe(): string;
 }
@@ -355,12 +372,12 @@ export function analyzeCore<D>(
     return acc;
   };
 
-  // The node-identity type oracle: one pass over every config's value store
-  // joins each core name's bindings; the normalizer's node → name map then
-  // keys those joins by source node. Built once on first query.
-  let nodeTypesCache: Map<Node, TypeSig> | null = null;
-  const nodeTypes = (): ReadonlyMap<Node, TypeSig> => {
-    if (nodeTypesCache) return nodeTypesCache;
+  // One pass over every config's value store joins each core name's
+  // bindings — shared by the node-identity type oracle and the receiver-
+  // shape query. Built once, lazily.
+  let byNameCache: Map<Name, D> | null = null;
+  const joinedByName = (): Map<Name, D> => {
+    if (byNameCache) return byNameCache;
     const byName = new Map<Name, D>();
     for (const [, store] of collecting.configs) {
       for (const [addr, v] of store.vals) {
@@ -368,6 +385,16 @@ export function analyzeCore<D>(
         byName.set(addr.name, prev === undefined ? v : domain.lattice.join(prev, v));
       }
     }
+    byNameCache = byName;
+    return byName;
+  };
+
+  // The node-identity type oracle: the joined per-name bindings, keyed by
+  // source node through the normalizer's node → name map.
+  let nodeTypesCache: Map<Node, TypeSig> | null = null;
+  const nodeTypes = (): ReadonlyMap<Node, TypeSig> => {
+    if (nodeTypesCache) return nodeTypesCache;
+    const byName = joinedByName();
     const out = new Map<Node, TypeSig>();
     for (const [node, name] of nodeNames ?? []) {
       const v = byName.get(name);
@@ -379,6 +406,21 @@ export function analyzeCore<D>(
     return out;
   };
   const typeOfNode = (n: Node): TypeSig | undefined => nodeTypes().get(n);
+
+  // The node-identity receiver-shape query (echojs shapes-plan P4.3): the
+  // node's core name's joined value → its objects' shapes, with construction
+  // intermediates subsumed (the layouts() terminal filter). Fail-soft:
+  // unmapped node → undefined; mapped-but-objectless → [].
+  const receiverShapesOfNode = (n: Node): Shape[] | undefined => {
+    const name = nodeNames?.get(n);
+    if (name === undefined) return undefined;
+    const v = joinedByName().get(name);
+    if (v === undefined || domain.isBottom(v)) return undefined;
+    return terminalShapes(shapesOfValue(v));
+  };
+
+  const fieldOrderOfShape = (s: Shape): readonly string[] | undefined =>
+    machine.shapes.insertionOrderOf(s);
 
   // The heap summary (join of every store) — objects live here.
   const heap = collecting.store.objs;
@@ -537,6 +579,8 @@ export function analyzeCore<D>(
     valueOfVar,
     nodeTypes,
     typeOfNode,
+    receiverShapesOfNode,
+    fieldOrderOfShape,
     shapesOfValue,
     shapesOfVar: (name) => shapesOfValue(valueOfVar(name)),
     layouts,

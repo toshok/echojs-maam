@@ -86,9 +86,20 @@ export class ShapeTable {
   private readonly edges = new Map<string, Shape>();
   private readonly emptyShape: Shape;
   private readonly topShape: Shape;
+  /**
+   * First-interning insertion order, by shape id — the **ordered witness**
+   * an AOT runtime needs (its shapes are transition chains, so insertion
+   * order IS class identity there; see echojs shapes-plan P4.3). Interning
+   * here stays order-INSENSITIVE; this just records the field order of the
+   * FIRST transition path that reached each class. A runtime object built
+   * in a different order simply fails its (order-sensitive) shape guard and
+   * takes the generic path — a missed fast path, never a wrong answer.
+   */
+  private readonly orders = new Map<number, readonly PropName[]>();
 
   constructor() {
     this.emptyShape = this.intern([]);
+    this.orders.set(this.emptyShape.id, []);
     this.topShape = { id: this.nextId++, fields: [], megamorphic: true };
   }
 
@@ -163,8 +174,27 @@ export class ShapeTable {
       }
       to = this.intern(next);
       this.edges.set(ek, to);
+      // The ordered witness: appending extends the source order; a
+      // representation change keeps the field set (and order) as-is.
+      // First mapping wins — a later path reaching the same class in a
+      // different order does not overwrite (see `orders`).
+      if (!this.orders.has(to.id)) {
+        const from = this.orders.get(s.id);
+        if (from !== undefined) this.orders.set(to.id, idx < 0 ? [...from, name] : from);
+      }
     }
     return to;
+  }
+
+  /**
+   * The insertion order of `s`'s fields on the first transition path that
+   * interned it, or `undefined` for the megamorphic ⊤ shape (or a foreign
+   * shape). Guaranteed to be a permutation of `s.fields`' names when
+   * present.
+   */
+  insertionOrderOf(s: Shape): readonly PropName[] | undefined {
+    if (s.megamorphic) return undefined;
+    return this.orders.get(s.id);
   }
 
   /** How many distinct shapes have been interned (for reporting/metrics). */

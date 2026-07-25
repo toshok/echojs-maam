@@ -411,12 +411,32 @@ export function analyzeCore<D>(
   // node's core name's joined value → its objects' shapes, with construction
   // intermediates subsumed (the layouts() terminal filter). Fail-soft:
   // unmapped node → undefined; mapped-but-objectless → [].
+  //
+  // The terminal filter runs PER OBJECT ADDRESS, not over the joined list
+  // (shapes-plan P4.6): an object's own construction intermediates are
+  // subsumed by its own terminal, but one receiver class's terminal must
+  // not be absorbed by a DIFFERENT class's superset shape — a {x,y}
+  // receiver beside a {x,y,z} receiver is a 2-shape site, not a
+  // monomorphic {x,y,z} one (the global filter reported exactly that,
+  // which made the runtime guard silently miss half the receivers).
   const receiverShapesOfNode = (n: Node): Shape[] | undefined => {
     const name = nodeNames?.get(n);
     if (name === undefined) return undefined;
     const v = joinedByName().get(name);
     if (v === undefined || domain.isBottom(v)) return undefined;
-    return terminalShapes(shapesOfValue(v));
+    const seen = new Set<number>();
+    const out: Shape[] = [];
+    for (const oaddr of domain.elimObj(v)) {
+      const obj = heap.get(oaddr);
+      if (!obj) continue;
+      for (const s of terminalShapes([...obj.shapes])) {
+        if (!seen.has(s.id)) {
+          seen.add(s.id);
+          out.push(s);
+        }
+      }
+    }
+    return out;
   };
 
   const fieldOrderOfShape = (s: Shape): readonly string[] | undefined =>

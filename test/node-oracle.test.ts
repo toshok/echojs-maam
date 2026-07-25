@@ -267,6 +267,27 @@ test("receiverShapesOfNode: construction intermediates are subsumed to the termi
   assert.deepEqual(r.fieldOrderOfShape(shapes![0]!), ["a", "b"]);
 });
 
+test("receiverShapesOfNode: distinct receiver classes both survive the terminal filter (P4.6)", () => {
+  // f({x,y}); f({x,y,z}) — the {x,y} receiver's terminal must NOT be
+  // absorbed by the other class's superset shape (the global-filter bug
+  // reported this 2-shape site as monomorphic {x,y,z}, so the emitted
+  // guard silently missed every {x,y} receiver).  Intermediates of each
+  // object are still subsumed by that object's own terminal.
+  const recv = id("p");
+  const member = { type: "MemberExpression", object: recv, property: id("x"), computed: false };
+  const prog = program([
+    fnDecl("f", [id("p")], [varDecl("t", member), exprStmt(id("t"))]),
+    exprStmt(call(id("f"), [objLit([["x", lit(1)], ["y", lit(2)]])])),
+    exprStmt(call(id("f"), [objLit([["x", lit(3)], ["y", lit(4)], ["z", lit(5)]])])),
+  ]);
+  const r = run(prog);
+  const shapes = r.receiverShapesOfNode(recv as unknown as Node);
+  assert.ok(shapes, "receiver is mapped");
+  const sets = shapes!.map((s) => [...s.fields].map((f) => f.name).sort().join(",")).sort();
+  assert.deepEqual(sets, ["x,y", "x,y,z"]);
+  for (const s of shapes!) assert.ok(r.fieldOrderOfShape(s), "each keeps its ordered witness");
+});
+
 test("receiverShapesOfNode: a foreign node fail-softs to undefined", () => {
   const prog = program([varDecl("p", objLit([["x", lit(1)]])), exprStmt(id("p"))]);
   const r = run(prog);

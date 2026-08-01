@@ -28,6 +28,8 @@ function showConcrete(r: AnalysisResult<FinSet<CVal<Loc>>>): string {
     switch (v.t) {
       case "num":
         return String(v.v);
+      case "bigint":
+        return `${v.v}n`;
       case "bool":
         return String(v.v);
       case "str":

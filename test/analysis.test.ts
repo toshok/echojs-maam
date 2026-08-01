@@ -19,6 +19,8 @@ function concreteResult(src: string): unknown[] {
       switch (v.t) {
         case "num":
           return v.v;
+        case "bigint":
+          return v.v;
         case "bool":
           return v.v;
         case "str":

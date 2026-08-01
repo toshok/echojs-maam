@@ -22,7 +22,7 @@ import type { Closure, OAddr } from "./state.js";
 import type { TypeSig } from "./shapes.js";
 
 /** Canonical field-type ordering, so representations render/compare stably. */
-const TAG_ORDER = ["num", "str", "bool", "null", "undefined", "fn", "obj"] as const;
+const TAG_ORDER = ["num", "bigint", "str", "bool", "null", "undefined", "fn", "obj"] as const;
 
 function renderTags(tags: ReadonlySet<string>): TypeSig {
   if (tags.has("⊤")) return "⊤"; // top absorbs every other tag
@@ -127,6 +127,7 @@ export type Prim = number | string | boolean | null | undefined;
  */
 export type CVal<Ctx> =
   | { readonly t: "num"; readonly v: number }
+  | { readonly t: "bigint"; readonly v: bigint }
   | { readonly t: "bool"; readonly v: boolean }
   | { readonly t: "str"; readonly v: string }
   | { readonly t: "null" }
@@ -147,6 +148,8 @@ function cvalKey<Ctx>(closureK: Keyable<Closure<Ctx>>, oaddrK: Keyable<OAddr<Ctx
           // `String(-0)` is `"0"`: key −0 distinctly so a set holding both zeros
           // does not silently drop one (exactness, not just soundness).
           return `n:${Number.isFinite(v.v) ? (Object.is(v.v, -0) ? "-0" : v.v) : `#${v.v}`}`;
+        case "bigint":
+          return `bi:${v.v}`;
         case "bool":
           return `b:${v.v}`;
         case "str":
@@ -172,6 +175,8 @@ function truthyC<Ctx>(v: CVal<Ctx>): boolean {
   switch (v.t) {
     case "num":
       return v.v !== 0 && !Number.isNaN(v.v);
+    case "bigint":
+      return v.v !== 0n;
     case "bool":
       return v.v;
     case "str":
@@ -191,6 +196,7 @@ function truthyC<Ctx>(v: CVal<Ctx>): boolean {
 function applyBinC<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
   // A ⊤ operand poisons the result — the concrete domain has no partial tops.
   if (a.t === "top" || b.t === "top") return { t: "top" };
+  if (a.t === "bigint" || b.t === "bigint") return applyBinBig(op, a, b);
   // ToNumber (differential-harness finding): `null` coerces to 0, not NaN —
   // `1 + null` is 1 in JS. `undefined` (and uncoercible values) stay NaN.
   const num = (x: CVal<Ctx>): number =>
@@ -254,8 +260,114 @@ function applyBinC<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
   }
 }
 
+// A binary operation with at least one bigint operand, evaluated with real JS
+// semantics on faithful operand representatives (bigints and primitives as
+// themselves; objects/closures/intrinsics as their ToPrimitive strings, which
+// is what the non-bigint paths use too).  Operations the real semantics
+// REJECT — mixed-type arithmetic, `>>>`, division by `0n` — throw here; the
+// machine has no exception channel out of δ, so those degrade to ⊤ rather
+// than claim a value.
+function applyBinBig<Ctx>(op: BinOp, a: CVal<Ctx>, b: CVal<Ctx>): CVal<Ctx> {
+  const raw = (x: CVal<Ctx>): number | bigint | boolean | string | null | undefined => {
+    switch (x.t) {
+      case "num":
+      case "bigint":
+      case "bool":
+      case "str":
+        return x.v;
+      case "null":
+        return null;
+      case "undef":
+        return undefined;
+      default:
+        return cvalToJs(x);
+    }
+  };
+  const wrap = (v: number | bigint | boolean | string): CVal<Ctx> =>
+    typeof v === "bigint"
+      ? { t: "bigint", v }
+      : typeof v === "number"
+        ? { t: "num", v }
+        : typeof v === "boolean"
+          ? { t: "bool", v }
+          : { t: "str", v };
+  const x = raw(a);
+  const y = raw(b);
+  try {
+    switch (op) {
+      case "+":
+        return wrap((x as never) + (y as never));
+      case "-":
+        return wrap((x as never) - (y as never));
+      case "*":
+        return wrap((x as never) * (y as never));
+      case "/":
+        return wrap((x as never) / (y as never));
+      case "%":
+        return wrap((x as never) % (y as never));
+      case "**":
+        return wrap((x as never) ** (y as never));
+      case "&":
+        return wrap((x as never) & (y as never));
+      case "|":
+        return wrap((x as never) | (y as never));
+      case "^":
+        return wrap((x as never) ^ (y as never));
+      case "<<":
+        return wrap((x as never) << (y as never));
+      case ">>":
+        return wrap((x as never) >> (y as never));
+      case ">>>":
+        return wrap((x as never) >>> (y as never)); // throws: not defined for BigInt
+      case "<":
+        return { t: "bool", v: (x as never) < (y as never) };
+      case "<=":
+        return { t: "bool", v: (x as never) <= (y as never) };
+      case ">":
+        return { t: "bool", v: (x as never) > (y as never) };
+      case ">=":
+        return { t: "bool", v: (x as never) >= (y as never) };
+      case "===":
+        return { t: "bool", v: cvalStrictEq(a, b) };
+      case "!==":
+        return { t: "bool", v: !cvalStrictEq(a, b) };
+      case "==":
+        return { t: "bool", v: (x as never) == (y as never) };
+      case "!=":
+        return { t: "bool", v: (x as never) != (y as never) };
+      case "instanceof":
+      case "in":
+        return { t: "bool", v: false }; // conservative, as in applyBinC
+      case "&&":
+        return truthyC(a) ? b : a;
+      case "||":
+        return truthyC(a) ? a : b;
+    }
+  } catch (_e) {
+    return { t: "top" };
+  }
+}
+
 function applyUnC<Ctx>(op: UnOp, a: CVal<Ctx>): CVal<Ctx> {
   if (a.t === "top") return op === "void" ? { t: "undef" } : { t: "top" };
+  if (a.t === "bigint") {
+    switch (op) {
+      case "-":
+        return { t: "bigint", v: -a.v };
+      case "~":
+        return { t: "bigint", v: ~a.v };
+      case "+":
+        return { t: "top" }; // unary + is ToNumber, which throws on bigints
+      case "!":
+        return { t: "bool", v: !truthyC(a) };
+      case "typeof":
+        return { t: "str", v: "bigint" };
+      case "void":
+        return { t: "undef" };
+      case "toStr":
+        return { t: "str", v: String(a.v) };
+    }
+  }
   const num = (x: CVal<Ctx>): number =>
     x.t === "num" ? x.v : x.t === "bool" ? (x.v ? 1 : 0) : x.t === "str" ? Number(x.v) : x.t === "null" ? 0 : NaN;
   switch (op) {
@@ -294,6 +406,8 @@ function cvalStrictEq<Ctx>(a: CVal<Ctx>, b: CVal<Ctx>): boolean {
   switch (a.t) {
     case "num":
       return a.v === (b as typeof a).v;
+    case "bigint":
+      return a.v === (b as typeof a).v;
     case "bool":
       return a.v === (b as typeof a).v;
     case "str":
@@ -322,6 +436,8 @@ function cvalToJs<Ctx>(a: CVal<Ctx>): string {
   switch (a.t) {
     case "num":
       return String(a.v);
+    case "bigint":
+      return String(a.v); // ToString(10n) is "10" — no `n` suffix
     case "bool":
       return String(a.v);
     case "str":
@@ -346,6 +462,8 @@ function cvalTypeof<Ctx>(a: CVal<Ctx>): string {
   switch (a.t) {
     case "num":
       return "number";
+    case "bigint":
+      return "bigint";
     case "bool":
       return "boolean";
     case "str":
@@ -439,6 +557,7 @@ export function concreteDomain<Ctx>(
           return { v: null };
         case "undef":
           return { v: undefined };
+        case "bigint": // not a Prim: intrinsic calls on bigints degrade visibly
         case "clo":
         case "obj":
         case "intr":
@@ -453,6 +572,8 @@ function cvalTag<Ctx>(v: CVal<Ctx>): string {
   switch (v.t) {
     case "num":
       return "num";
+    case "bigint":
+      return "bigint";
     case "str":
       return "str";
     case "bool":
@@ -475,6 +596,8 @@ function litToCVal<Ctx>(l: Lit): CVal<Ctx> {
   switch (l.kind) {
     case "num":
       return { t: "num", v: l.value };
+    case "bigint":
+      return { t: "bigint", v: l.value };
     case "bool":
       return { t: "bool", v: l.value };
     case "str":
@@ -640,21 +763,45 @@ export function abstractDomain<Ctx>(
   const numbersOf = (v: AVal<Ctx>): "top" | number[] | null =>
     v.nums.top ? "top" : v.nums.items.isEmpty() ? null : v.nums.items.toArray();
 
+  // An operand whose every constituent is a primitive the domain represents
+  // (number/string/boolean/null/undefined).  Such a value can never be a
+  // BigInt — the domain has no bigint constituent, so bigints appear only as
+  // ⊤ — and it cannot coerce to one either (only objects, via valueOf/
+  // @@toPrimitive, can produce a bigint under ToNumeric).
+  const provenBigintFree = (v: AVal<Ctx>): boolean =>
+    !v.topP && v.objs.isEmpty() && v.clos.isEmpty() && v.intrinsics.isEmpty();
+  // ... and of exactly one type (used to sharpen `+`).
+  const provenStr = (v: AVal<Ctx>): boolean =>
+    provenBigintFree(v) &&
+    (v.strs.top || !v.strs.items.isEmpty()) &&
+    (!v.nums.top && v.nums.items.isEmpty()) &&
+    v.bools.isEmpty() && !v.nullP && !v.undefP;
+
   const binop = (op: BinOp, l: AVal<Ctx>, r: AVal<Ctx>): AVal<Ctx> => {
-    // A ⊤ operand: refine by what the operator can produce (numeric operators
-    // yield numbers, comparisons yield booleans, …) — sound, and keeps a single
-    // degraded operand from erasing the whole expression's type.
+    // A ⊤ operand: refine by what the operator can produce — but only when
+    // BigInt results are ruled out.  The numeric operators return a bigint
+    // when BOTH operands are bigints, and mixing a bigint with a non-bigint
+    // numeric operand throws; so one operand proven bigint-free means the
+    // operation, IF it completes, produced a number (the one-proven-number-
+    // operand rule).  Two ⊤ operands prove nothing: the result stays ⊤.
     if (l.topP || r.topP) {
+      const oneBigintFree = provenBigintFree(l) || provenBigintFree(r);
       switch (op) {
         case "-": case "*": case "/": case "%": case "**":
-        case "&": case "|": case "^": case "<<": case ">>": case ">>>":
-          return anyNum;
+        case "&": case "|": case "^": case "<<": case ">>":
+          return oneBigintFree ? anyNum : TOP;
+        case ">>>":
+          return anyNum; // >>> is not defined for BigInt: completion ⇒ number
         case "<": case "<=": case ">": case ">=":
         case "===": case "!==": case "==": case "!=":
         case "instanceof": case "in":
           return anyBool;
         case "+":
-          return lattice.join(anyNum, anyStr); // number or string, never anything else
+          // a proven-string operand makes the whole thing a string; a proven
+          // bigint-free one bounds it to number-or-string; otherwise both
+          // sides may be bigints and the sum another bigint — no refinement
+          if (provenStr(l) || provenStr(r)) return anyStr;
+          return oneBigintFree ? lattice.join(anyNum, anyStr) : TOP;
         case "&&":
         case "||":
           return lattice.join(l, r); // one of the operands — ⊤ absorbs
@@ -752,6 +899,8 @@ export function abstractDomain<Ctx>(
       switch (l.kind) {
         case "num":
           return num(l.value);
+        case "bigint":
+          return TOP; // no bigint constituent: soundly "any value"
         case "bool":
           return boolV(l.value);
         case "str":
@@ -774,10 +923,15 @@ export function abstractDomain<Ctx>(
     intrinsic: (id) => ({ ...bot, intrinsics: FinSet.of(intrK, id) }),
     binop,
     unop: (op, a) => {
-      // ⊤ operand: every unary operator still has a known result type.
+      // ⊤ operand: refine by what the operator can produce.  Unary `-` and
+      // `~` map bigints to bigints, so a ⊤ operand (the only way the domain
+      // represents a bigint) leaves the result ⊤; unary `+` is ToNumber,
+      // which THROWS on bigints — completion means a number.
       if (a.topP) {
         switch (op) {
-          case "-": case "+": case "~":
+          case "-": case "~":
+            return TOP;
+          case "+":
             return anyNum;
           case "!":
             return anyBool;

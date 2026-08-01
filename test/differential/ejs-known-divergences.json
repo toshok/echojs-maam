@@ -1,44 +1,19 @@
 {
   "//": [
-    "echojs-vs-node divergences the ejs lane FOUND and root-caused (2026-07-23,",
-    "echojs eir work tree, stage0 node-hosted compiler). Each is a pre-existing",
-    "echojs runtime/compiler bug verified by a minimal standalone probe — not a",
-    "maam machine bug (the concrete-vs-node lane is green on every one of these",
-    "files). Entries are structured (symptom + rootCause, both required — the",
-    "harness rejects malformed entries) so the record cannot rot into prose.",
-    "Gate semantics: a listed file that diverges reports KNOWN (non-failing); a",
-    "divergence NOT listed fails the gate; a listed file that stops diverging",
-    "fails the gate as STALE; a listed file that stops COMPILING (N/A) is",
-    "reported as unvalidatable — a warning, not a failure, because N/A means",
-    "the semantic claim cannot be tested in either direction (see harness).",
-    "Tracked in echojs docs/maam-p0-results.md 'Phase 3.5'."
-  ],
-  "arith-coercion.js": {
-    "symptom": "executable aborts (exit 134), empty stdout",
-    "rootCause": "`1 + null`: ejsval ToNumber(ejsval) at runtime/ejs-ops.c:260 is 'not implemented' and aborts. JS: null coerces to 0."
-  },
-  "arith-intops.js": {
-    "symptom": "-2147483571 instead of -2147483556 (delta 15 = the >>> term)",
-    "rootCause": "`-8 >>> 28` is 0 under echojs, 15 under node — ToUint32 on a negative unsigned-shift operand is wrong/unimplemented."
-  },
-  "arith-negzero.js": {
-    "symptom": "prints \"wrong\" instead of -0",
-    "rootCause": "`-0 === 0` is false under echojs (NaN-boxed bit comparison; strict equality must treat the zeros as equal). `1/-0` = -Infinity is correct, so it is the comparison, not -0 production."
-  },
-  "compare-numbers.js": {
-    "symptom": "third comparison false instead of true",
-    "rootCause": "same as arith-negzero.js: the `-0 === 0` strict-equality bug."
-  },
-  "math-statics.js": {
-    "symptom": "Math.round(-2.5) slot reads -3 instead of -2",
-    "rootCause": "echojs Math.round uses C round() semantics (half away from zero); JS rounds half toward +Infinity."
-  },
-  "strings-number-render.js": {
-    "symptom": "Number(\"  7  \") slot reads NaN instead of 7",
-    "rootCause": "echojs ToNumber(string) does not trim whitespace; the spec requires it."
-  },
-  "typeof-table.js": {
-    "symptom": "typeof null slot reads \"null\" instead of \"object\"",
-    "rootCause": "echojs typeof returns \"null\" for null; the spec requires \"object\"."
-  }
+    "echojs-vs-node divergences the ejs lane FOUND and root-caused. Each entry",
+    "is a pre-existing echojs runtime/compiler bug verified by a minimal",
+    "standalone probe — not a maam machine bug (the concrete-vs-node lane must",
+    "be green on the file). Entries are structured (symptom + rootCause, both",
+    "required — the harness rejects malformed entries) so the record cannot",
+    "rot into prose. Gate semantics: a listed file that diverges reports KNOWN",
+    "(non-failing); a divergence NOT listed fails the gate; a listed file that",
+    "stops diverging fails the gate as STALE; a listed file that stops",
+    "COMPILING (N/A) is reported as unvalidatable — a warning, not a failure,",
+    "because N/A means the semantic claim cannot be tested in either direction",
+    "(see harness). Tracked in echojs docs/maam-p0-results.md 'Phase 3.5'.",
+    "Currently empty: the original seven 2026-07-23 entries (1+null abort,",
+    "negative >>> ToUint32, -0 === 0, Math.round ties, Number-string trim,",
+    "typeof null) were all fixed by echojs runtime-P1 and removed when the",
+    "lane verified them green."
+  ]
 }

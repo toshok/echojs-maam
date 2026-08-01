@@ -3,7 +3,7 @@
   "//": "CommonJS build variant so the (CJS, node 22.x — no require(esm)) EchoJS compiler tree can `require()` the oracle API. `verbatimModuleSyntax` must be off to emit ESM-syntax sources as CJS; the build script drops a `{\"type\":\"commonjs\"}` package.json into the outDir so node treats the emitted .js as CJS despite the root `\"type\": \"module\"`.",
   "compilerOptions": {
     "module": "CommonJS",
-    "moduleResolution": "Node10",
+    "moduleResolution": "bundler",
     "verbatimModuleSyntax": false,
     "rootDir": "src",
     "outDir": "dist/cjs"

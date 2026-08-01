@@ -139,6 +139,8 @@ const renderCVal = (v: CVal<Loc>): string => {
   switch (v.t) {
     case "num":
       return renderNumber(v.v);
+    case "bigint":
+      return `${v.v}n`;
     case "str":
       return escapeString(v.v);
     case "bool":
@@ -180,6 +182,7 @@ const PRELUDE = `function __diffRender(v) {
     return out + '"';
   }
   if (typeof v === "boolean") return String(v);
+  if (typeof v === "bigint") return String(v) + "n";
   if (v === null) return "null";
   if (v === undefined) return "undefined";
   if (typeof v === "function") return "<function>";

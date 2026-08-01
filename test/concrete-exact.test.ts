@@ -32,6 +32,7 @@ const run = (src: string): Run => {
   const values = [...set].map((v) => {
     switch (v.t) {
       case "num":
+      case "bigint":
       case "bool":
       case "str":
         return v.v;

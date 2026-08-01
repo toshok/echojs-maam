@@ -19,6 +19,7 @@
     "forceConsistentCasingInFileNames": true,
 
     "skipLibCheck": true,
+    "types": ["node"],
     "verbatimModuleSyntax": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "examples/**/*.ts"]

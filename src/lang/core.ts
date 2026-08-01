@@ -36,6 +36,7 @@ export const thisVarName = (lamLoc: Loc): Name => `this$${lamLoc}`;
  */
 export type Lit =
   | { readonly kind: "num"; readonly value: number }
+  | { readonly kind: "bigint"; readonly value: bigint }
   | { readonly kind: "bool"; readonly value: boolean }
   | { readonly kind: "str"; readonly value: string }
   | { readonly kind: "null" }
@@ -174,6 +175,7 @@ export type Expr =
 // --- smart constructors (used by the normalizer and hand-written tests) -----
 
 export const litNum = (value: number): Lit => ({ kind: "num", value });
+export const litBigint = (value: bigint): Lit => ({ kind: "bigint", value });
 export const litBool = (value: boolean): Lit => ({ kind: "bool", value });
 export const litStr = (value: string): Lit => ({ kind: "str", value });
 export const litNull: Lit = { kind: "null" };
@@ -201,6 +203,8 @@ export function litToString(l: Lit): string {
   switch (l.kind) {
     case "num":
       return String(l.value);
+    case "bigint":
+      return `${l.value}n`;
     case "bool":
       return String(l.value);
     case "str":

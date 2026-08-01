@@ -38,7 +38,7 @@ import { spanOf } from "./ast.js";
 /** A top-level item: an ordinary statement or an ES module declaration. */
 type Stmt = Statement | ModuleDeclaration;
 import type { AExp, BinOp, Expr, Lit, Loc, Name, RHS, UnOp } from "./core.js";
-import { Fresh, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
+import { Fresh, litBigint, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
 
 export class NormalizeError extends Error {
   constructor(message: string) {
@@ -251,14 +251,29 @@ class Normalizer {
    * list are hoisted into a leading `letrec`.
    */
   normStmts(stmts: ReadonlyArray<Stmt>, scope: Scope, k: (scope: Scope) => Expr): Expr {
-    const funcs = stmts.filter((s): s is FunctionDeclaration => s.type === "FunctionDeclaration");
+    const allFuncs = stmts.filter((s): s is FunctionDeclaration => s.type === "FunctionDeclaration");
+    // async/generator functions are not modeled: their name binds ⊤ (a call
+    // then degrades as an unknown call), their body is never compiled, and
+    // the degradation is VISIBLE — never a silently-sync mis-model (an async
+    // call really returns a Promise, not the body's return value).
+    const funcs = allFuncs.filter((f) => !unmodeledFnKind(f));
+    const degradedFuncs = allFuncs.filter((f) => unmodeledFnKind(f));
     const rest = stmts.filter((s) => s.type !== "FunctionDeclaration");
 
     let scope1: Scope = scope;
-    if (funcs.length > 0) {
+    if (funcs.length > 0 || degradedFuncs.length > 0) {
       const m = new Map(scope);
       for (const f of funcs) m.set(fnName(f), this.fresh.name(fnName(f)));
+      for (const f of degradedFuncs) m.set(fnName(f), this.fresh.name(fnName(f)));
       scope1 = m;
+    }
+    for (const f of degradedFuncs) {
+      if (f.id) this.mapNode(f.id, scope1.get(fnName(f))!);
+      this.degradedBindings.push({
+        name: fnName(f),
+        reason: `${unmodeledFnKind(f)} functions are not modeled; the binding holds ⊤`,
+        span: spanOf(f),
+      });
     }
 
     // JS hoisting (differential-harness finding, extended per adversarial
@@ -395,7 +410,21 @@ class Normalizer {
       }
     }
 
-    if (funcs.length === 0 && captured.size === 0) return this.normStmtSeq(rest, scope1, k);
+    // the ⊤ bindings for unmodeled (async/generator) function declarations,
+    // wrapped around whatever this list compiles to
+    const wrapDegraded = (body: Expr): Expr => {
+      let out = body;
+      for (const f of [...degradedFuncs].reverse()) {
+        out = this.letE(
+          scope1.get(fnName(f))!,
+          { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litTop) },
+          out,
+        );
+      }
+      return out;
+    };
+
+    if (funcs.length === 0 && captured.size === 0) return wrapDegraded(this.normStmtSeq(rest, scope1, k));
 
     const hoisted = new Map<string, Name>();
     const scopeBody = new Map(scope1);
@@ -422,7 +451,7 @@ class Normalizer {
     for (const u of [...hoisted.values()].reverse()) {
       out = this.letE(u, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litUndef) }, out);
     }
-    return out;
+    return wrapDegraded(out);
   }
 
   private normStmtSeq(stmts: ReadonlyArray<Stmt>, scope: Scope, k: (scope: Scope) => Expr, hoisted?: ReadonlyMap<string, Name>): Expr {
@@ -969,6 +998,16 @@ class Normalizer {
         if (!scope.has(e.name) && e.name === "NaN") return k(this.litA(litNum(NaN)));
         return k(this.varA(scope.get(e.name) ?? e.name));
       case "FunctionExpression": {
+        // async/generator functions are not modeled: the expression is ⊤,
+        // visibly degraded (see the declaration path in normStmts)
+        if (unmodeledFnKind(e)) {
+          this.degradedBindings.push({
+            name: e.id?.name ?? "(anonymous)",
+            reason: `${unmodeledFnKind(e)} functions are not modeled; the value is ⊤`,
+            span: spanOf(e),
+          });
+          return k(this.litA(litTop));
+        }
         const self = e.id?.name;
         if (self !== undefined) {
           const selfUnique = this.fresh.name(self);
@@ -985,6 +1024,14 @@ class Normalizer {
         return k(this.compileFunction(e.params, e.body, scope, { span: spanOf(e) }, false, e as OldFunctionDialect));
       }
       case "ArrowFunctionExpression":
+        if (unmodeledFnKind(e)) {
+          this.degradedBindings.push({
+            name: "(arrow)",
+            reason: `${unmodeledFnKind(e)} functions are not modeled; the value is ⊤`,
+            span: spanOf(e),
+          });
+          return k(this.litA(litTop));
+        }
         return k(this.compileFunction(e.params, e.body, scope, { span: spanOf(e) }, /* isArrow */ true, e as OldFunctionDialect));
       case "BinaryExpression":
         return this.normAtom(e.left as EExpr, scope, (l) =>
@@ -2133,10 +2180,24 @@ function fnName(f: FunctionDeclaration): string {
   return f.id.name;
 }
 
+/** Which unmodeled function kind this is (`async` covers async generators),
+ * or null for a plain function the normalizer compiles. */
+function unmodeledFnKind(f: {
+  async?: boolean | undefined;
+  generator?: boolean | undefined;
+}): "async" | "generator" | null {
+  if (f.async) return "async";
+  if (f.generator) return "generator";
+  return null;
+}
+
 function literal(e: Node): Lit {
   const withExtras = e as Node & { bigint?: string; regex?: unknown; value: unknown };
   if (withExtras.regex) throw new NormalizeError("regular-expression literals are not supported.");
-  if (withExtras.bigint !== undefined) throw new NormalizeError("bigint literals are not supported.");
+  // ESTree carries the digits in `bigint` (`value` may be null after a JSON
+  // round trip); the concrete domain evaluates bigints exactly, the abstract
+  // domain widens them to ⊤ (it has no bigint constituent).
+  if (withExtras.bigint !== undefined) return litBigint(BigInt(withExtras.bigint));
   const v = withExtras.value;
   if (typeof v === "number") return litNum(v);
   if (typeof v === "string") return litStr(v);

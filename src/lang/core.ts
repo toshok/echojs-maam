@@ -298,109 +298,138 @@ export function exprToString(e: Expr): string {
 type Lam = Extract<AExp, { tag: "lam" }>;
 const fvLamCache = new WeakMap<Lam, ReadonlySet<Name>>();
 
-function fvAExp(a: AExp, acc: Set<Name>): void {
+// The walk threads one accumulator plus a multiset of names bound by
+// enclosing binders, testing boundness at each reference, instead of
+// building a set per scope and copying it out through every level.
+// Per-scope sets are quadratic on the shapes normalize actually emits:
+// module-sized let-spines, and switch statements lowered to if-chains
+// hundreds of arms deep (fv of lib/compiler burned whole minutes).
+type BoundNames = Map<Name, number>;
+
+function bindName(bound: BoundNames, n: Name): void {
+  bound.set(n, (bound.get(n) ?? 0) + 1);
+}
+
+function unbindName(bound: BoundNames, n: Name): void {
+  const c = bound.get(n)!;
+  if (c === 1) bound.delete(n);
+  else bound.set(n, c - 1);
+}
+
+function fvAExp(a: AExp, acc: Set<Name>, bound: BoundNames): void {
   switch (a.tag) {
     case "var":
-      acc.add(a.name);
+      if (!bound.has(a.name)) acc.add(a.name);
       return;
     case "lit":
       return;
     case "lam":
-      for (const n of freeVarsOfLam(a)) acc.add(n);
+      for (const n of freeVarsOfLam(a)) if (!bound.has(n)) acc.add(n);
       return;
   }
 }
 
-function fvRHS(r: RHS, acc: Set<Name>): void {
+function fvRHS(r: RHS, acc: Set<Name>, bound: BoundNames): void {
   switch (r.tag) {
     case "atom":
-      return fvAExp(r.atom, acc);
+      return fvAExp(r.atom, acc, bound);
     case "bin":
-      fvAExp(r.l, acc);
-      return fvAExp(r.r, acc);
+      fvAExp(r.l, acc, bound);
+      return fvAExp(r.r, acc, bound);
     case "un":
-      return fvAExp(r.arg, acc);
+      return fvAExp(r.arg, acc, bound);
     case "call":
     case "new":
-      fvAExp(r.fn, acc);
-      for (const a of r.args) fvAExp(a, acc);
+      fvAExp(r.fn, acc, bound);
+      for (const a of r.args) fvAExp(a, acc, bound);
       return;
     case "method":
-      fvAExp(r.obj, acc);
-      for (const a of r.args) fvAExp(a, acc);
+      fvAExp(r.obj, acc, bound);
+      for (const a of r.args) fvAExp(a, acc, bound);
       return;
     case "apply":
-      fvAExp(r.fn, acc);
-      fvAExp(r.thisArg, acc);
-      for (const a of r.args) fvAExp(a, acc);
+      fvAExp(r.fn, acc, bound);
+      fvAExp(r.thisArg, acc, bound);
+      for (const a of r.args) fvAExp(a, acc, bound);
       return;
     case "obj":
-      for (const [, v] of r.fields) fvAExp(v, acc);
+      for (const [, v] of r.fields) fvAExp(v, acc, bound);
       return;
     case "array":
-      for (const v of r.elems) fvAExp(v, acc);
+      for (const v of r.elems) fvAExp(v, acc, bound);
       return;
     case "get":
     case "keys":
     case "iterElem":
-      return fvAExp(r.obj, acc);
+      return fvAExp(r.obj, acc, bound);
     case "put":
-      fvAExp(r.obj, acc);
-      return fvAExp(r.val, acc);
+      fvAExp(r.obj, acc, bound);
+      return fvAExp(r.val, acc, bound);
     case "getDyn":
-      fvAExp(r.obj, acc);
-      return fvAExp(r.keyExpr, acc);
+      fvAExp(r.obj, acc, bound);
+      return fvAExp(r.keyExpr, acc, bound);
     case "putDyn":
-      fvAExp(r.obj, acc);
-      fvAExp(r.keyExpr, acc);
-      return fvAExp(r.val, acc);
+      fvAExp(r.obj, acc, bound);
+      fvAExp(r.keyExpr, acc, bound);
+      return fvAExp(r.val, acc, bound);
     case "setVar":
-      acc.add(r.name); // a reassignment references the variable
-      return fvAExp(r.val, acc);
+      if (!bound.has(r.name)) acc.add(r.name); // a reassignment references the variable
+      return fvAExp(r.val, acc, bound);
     case "objectCreate":
-      return fvAExp(r.proto, acc);
+      return fvAExp(r.proto, acc, bound);
     case "setProto":
-      fvAExp(r.obj, acc);
-      return fvAExp(r.proto, acc);
+      fvAExp(r.obj, acc, bound);
+      return fvAExp(r.proto, acc, bound);
     case "defineAccessor":
-      fvAExp(r.obj, acc);
-      if (r.getter) fvAExp(r.getter, acc);
-      if (r.setter) fvAExp(r.setter, acc);
+      fvAExp(r.obj, acc, bound);
+      if (r.getter) fvAExp(r.getter, acc, bound);
+      if (r.setter) fvAExp(r.setter, acc, bound);
       return;
   }
 }
 
-function fvExpr(e: Expr, acc: Set<Name>): void {
+function fvExpr(e: Expr, acc: Set<Name>, bound: BoundNames): void {
   switch (e.tag) {
     case "ret":
-      return fvAExp(e.atom, acc);
+      return fvAExp(e.atom, acc, bound);
     case "let": {
-      fvRHS(e.rhs, acc);
-      const body = new Set<Name>();
-      fvExpr(e.body, body);
-      for (const n of body) if (n !== e.name) acc.add(n);
+      // iterative over the let-spine (its length is the function's
+      // statement count — too deep to recurse): each rhs is walked
+      // before its own name binds, so `let x = f(x)` sees the outer x,
+      // and the unwind restores the enclosing scope's bound counts.
+      const spine: Extract<Expr, { tag: "let" }>[] = [];
+      let tail: Expr = e;
+      while (tail.tag === "let") {
+        spine.push(tail);
+        fvRHS(tail.rhs, acc, bound);
+        bindName(bound, tail.name);
+        tail = tail.body;
+      }
+      fvExpr(tail, acc, bound);
+      for (let i = spine.length - 1; i >= 0; i--) unbindName(bound, spine[i]!.name);
       return;
     }
     case "letrec": {
-      const bound = new Set(e.bindings.map((b) => b.name));
-      const inner = new Set<Name>();
-      for (const b of e.bindings) fvAExp(b.lam, inner);
-      fvExpr(e.body, inner);
-      for (const n of inner) if (!bound.has(n)) acc.add(n);
+      // recursive scope: every binding name is visible in every
+      // binding's lambda as well as in the body
+      for (const b of e.bindings) bindName(bound, b.name);
+      for (const b of e.bindings) fvAExp(b.lam, acc, bound);
+      fvExpr(e.body, acc, bound);
+      for (const b of e.bindings) unbindName(bound, b.name);
       return;
     }
     case "if":
-      fvAExp(e.cond, acc);
-      fvExpr(e.then, acc);
-      return fvExpr(e.else, acc);
+      fvAExp(e.cond, acc, bound);
+      fvExpr(e.then, acc, bound);
+      return fvExpr(e.else, acc, bound);
     case "tailcall":
-      fvAExp(e.fn, acc);
-      for (const a of e.args) fvAExp(a, acc);
+      fvAExp(e.fn, acc, bound);
+      for (const a of e.args) fvAExp(a, acc, bound);
       return;
     case "throw":
-      return fvAExp(e.val, acc);
+      return fvAExp(e.val, acc, bound);
     case "nondet":
-      for (const alt of e.alts) fvExpr(alt, acc);
+      for (const alt of e.alts) fvExpr(alt, acc, bound);
       return;
   }
 }
@@ -415,9 +444,10 @@ function fvExpr(e: Expr, acc: Set<Name>): void {
 export function freeVarsOfLam(lam: Lam): ReadonlySet<Name> {
   let cached = fvLamCache.get(lam);
   if (cached) return cached;
-  const body = new Set<Name>();
-  fvExpr(lam.body, body);
-  for (const p of lam.params) body.delete(p);
-  fvLamCache.set(lam, body);
-  return body;
+  const acc = new Set<Name>();
+  const bound: BoundNames = new Map();
+  for (const p of lam.params) bindName(bound, p);
+  fvExpr(lam.body, acc, bound);
+  fvLamCache.set(lam, acc);
+  return acc;
 }

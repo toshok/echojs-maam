@@ -298,156 +298,153 @@ export function exprToString(e: Expr): string {
 type Lam = Extract<AExp, { tag: "lam" }>;
 const fvLamCache = new WeakMap<Lam, ReadonlySet<Name>>();
 
-// The walk threads one accumulator plus a multiset of names bound by
-// enclosing binders, testing boundness at each reference, instead of
-// building a set per scope and copying it out through every level.
-// Per-scope sets are quadratic on the shapes normalize actually emits:
-// module-sized let-spines, and switch statements lowered to if-chains
-// hundreds of arms deep (fv of lib/compiler burned whole minutes).
-type BoundNames = Map<Name, number>;
-
-function bindName(bound: BoundNames, n: Name): void {
-  bound.set(n, (bound.get(n) ?? 0) + 1);
-}
-
-function unbindName(bound: BoundNames, n: Name): void {
-  const c = bound.get(n)!;
-  if (c === 1) bound.delete(n);
-  else bound.set(n, c - 1);
-}
-
-function fvAExp(a: AExp, acc: Set<Name>, bound: BoundNames): void {
-  switch (a.tag) {
-    case "var":
-      if (!bound.has(a.name)) acc.add(a.name);
-      return;
-    case "lit":
-      return;
-    case "lam":
-      for (const n of freeVarsOfLam(a)) if (!bound.has(n)) acc.add(n);
-      return;
-  }
-}
-
-function fvRHS(r: RHS, acc: Set<Name>, bound: BoundNames): void {
-  switch (r.tag) {
-    case "atom":
-      return fvAExp(r.atom, acc, bound);
-    case "bin":
-      fvAExp(r.l, acc, bound);
-      return fvAExp(r.r, acc, bound);
-    case "un":
-      return fvAExp(r.arg, acc, bound);
-    case "call":
-    case "new":
-      fvAExp(r.fn, acc, bound);
-      for (const a of r.args) fvAExp(a, acc, bound);
-      return;
-    case "method":
-      fvAExp(r.obj, acc, bound);
-      for (const a of r.args) fvAExp(a, acc, bound);
-      return;
-    case "apply":
-      fvAExp(r.fn, acc, bound);
-      fvAExp(r.thisArg, acc, bound);
-      for (const a of r.args) fvAExp(a, acc, bound);
-      return;
-    case "obj":
-      for (const [, v] of r.fields) fvAExp(v, acc, bound);
-      return;
-    case "array":
-      for (const v of r.elems) fvAExp(v, acc, bound);
-      return;
-    case "get":
-    case "keys":
-    case "iterElem":
-      return fvAExp(r.obj, acc, bound);
-    case "put":
-      fvAExp(r.obj, acc, bound);
-      return fvAExp(r.val, acc, bound);
-    case "getDyn":
-      fvAExp(r.obj, acc, bound);
-      return fvAExp(r.keyExpr, acc, bound);
-    case "putDyn":
-      fvAExp(r.obj, acc, bound);
-      fvAExp(r.keyExpr, acc, bound);
-      return fvAExp(r.val, acc, bound);
-    case "setVar":
-      if (!bound.has(r.name)) acc.add(r.name); // a reassignment references the variable
-      return fvAExp(r.val, acc, bound);
-    case "objectCreate":
-      return fvAExp(r.proto, acc, bound);
-    case "setProto":
-      fvAExp(r.obj, acc, bound);
-      return fvAExp(r.proto, acc, bound);
-    case "defineAccessor":
-      fvAExp(r.obj, acc, bound);
-      if (r.getter) fvAExp(r.getter, acc, bound);
-      if (r.setter) fvAExp(r.setter, acc, bound);
-      return;
-  }
-}
-
-function fvExpr(e: Expr, acc: Set<Name>, bound: BoundNames): void {
-  switch (e.tag) {
-    case "ret":
-      return fvAExp(e.atom, acc, bound);
-    case "let": {
-      // iterative over the let-spine (its length is the function's
-      // statement count — too deep to recurse): each rhs is walked
-      // before its own name binds, so `let x = f(x)` sees the outer x,
-      // and the unwind restores the enclosing scope's bound counts.
-      const spine: Extract<Expr, { tag: "let" }>[] = [];
-      let tail: Expr = e;
-      while (tail.tag === "let") {
-        spine.push(tail);
-        fvRHS(tail.rhs, acc, bound);
-        bindName(bound, tail.name);
-        tail = tail.body;
-      }
-      fvExpr(tail, acc, bound);
-      for (let i = spine.length - 1; i >= 0; i--) unbindName(bound, spine[i]!.name);
-      return;
-    }
-    case "letrec": {
-      // recursive scope: every binding name is visible in every
-      // binding's lambda as well as in the body
-      for (const b of e.bindings) bindName(bound, b.name);
-      for (const b of e.bindings) fvAExp(b.lam, acc, bound);
-      fvExpr(e.body, acc, bound);
-      for (const b of e.bindings) unbindName(bound, b.name);
-      return;
-    }
-    case "if":
-      fvAExp(e.cond, acc, bound);
-      fvExpr(e.then, acc, bound);
-      return fvExpr(e.else, acc, bound);
-    case "tailcall":
-      fvAExp(e.fn, acc, bound);
-      for (const a of e.args) fvAExp(a, acc, bound);
-      return;
-    case "throw":
-      return fvAExp(e.val, acc, bound);
-    case "nondet":
-      for (const alt of e.alts) fvExpr(alt, acc, bound);
-      return;
-  }
-}
-
 /**
  * The free variables of a lambda — the names its body references but does not
- * itself bind (params). Memoized per lambda node. Used to **trim** a closure's
- * captured environment to only what it can access: this both shrinks the
- * (serialized) environment keys that dominate control-state dedup and removes
- * spurious state distinctions on irrelevant bindings.
+ * itself bind. Memoized per lambda node. Used to **trim** a closure's captured
+ * environment to only what it can access: this both shrinks the (serialized)
+ * environment keys that dominate control-state dedup and removes spurious
+ * state distinctions on irrelevant bindings.
+ *
+ * Two structural facts shape the implementation:
+ *
+ * - Names are globally unique after normalization (see `Name`), so there is
+ *   no shadowing and fv is simply references ∖ binders — no scope tracking.
+ * - The core is a DAG, not a tree: the normalizer materializes a statement
+ *   sequence's continuation once and splices it into every branch arm by
+ *   reference (see normIf's `cont`), so sequential branching gives a node
+ *   exponentially many root paths. The visited set makes the walk O(nodes);
+ *   a tree walk here does not terminate on branch-heavy functions.
+ *
+ * Let-spines are walked iteratively — their length is a function's statement
+ * count, far past any comfortable recursion depth.
  */
 export function freeVarsOfLam(lam: Lam): ReadonlySet<Name> {
-  let cached = fvLamCache.get(lam);
+  const cached = fvLamCache.get(lam);
   if (cached) return cached;
-  const acc = new Set<Name>();
-  const bound: BoundNames = new Map();
-  for (const p of lam.params) bindName(bound, p);
-  fvExpr(lam.body, acc, bound);
-  fvLamCache.set(lam, acc);
-  return acc;
+
+  const refs = new Set<Name>();
+  const binders = new Set<Name>();
+  const visited = new WeakSet<Expr>();
+  for (const p of lam.params) binders.add(p);
+
+  const atom = (a: AExp): void => {
+    switch (a.tag) {
+      case "var":
+        refs.add(a.name);
+        return;
+      case "lit":
+        return;
+      case "lam":
+        // the nested lambda's own binders are already subtracted; what
+        // it captures is a plain reference from our point of view
+        for (const n of freeVarsOfLam(a)) refs.add(n);
+        return;
+    }
+  };
+
+  const rhs = (r: RHS): void => {
+    switch (r.tag) {
+      case "atom":
+        return atom(r.atom);
+      case "bin":
+        atom(r.l);
+        return atom(r.r);
+      case "un":
+        return atom(r.arg);
+      case "call":
+      case "new":
+        atom(r.fn);
+        r.args.forEach(atom);
+        return;
+      case "method":
+        atom(r.obj);
+        r.args.forEach(atom);
+        return;
+      case "apply":
+        atom(r.fn);
+        atom(r.thisArg);
+        r.args.forEach(atom);
+        return;
+      case "obj":
+        for (const [, v] of r.fields) atom(v);
+        return;
+      case "array":
+        r.elems.forEach(atom);
+        return;
+      case "get":
+      case "keys":
+      case "iterElem":
+        return atom(r.obj);
+      case "put":
+        atom(r.obj);
+        return atom(r.val);
+      case "getDyn":
+        atom(r.obj);
+        return atom(r.keyExpr);
+      case "putDyn":
+        atom(r.obj);
+        atom(r.keyExpr);
+        return atom(r.val);
+      case "setVar":
+        refs.add(r.name); // a reassignment references the variable
+        return atom(r.val);
+      case "objectCreate":
+        return atom(r.proto);
+      case "setProto":
+        atom(r.obj);
+        return atom(r.proto);
+      case "defineAccessor":
+        atom(r.obj);
+        if (r.getter) atom(r.getter);
+        if (r.setter) atom(r.setter);
+        return;
+    }
+  };
+
+  const walk = (e0: Expr): void => {
+    let e = e0;
+    // iterative over let-spines; the visited check doubles as the DAG
+    // sharing cutoff and the guard against re-entering a shared spine
+    while (true) {
+      if (visited.has(e)) return;
+      visited.add(e);
+      switch (e.tag) {
+        case "let":
+          binders.add(e.name);
+          rhs(e.rhs);
+          e = e.body;
+          continue;
+        case "ret":
+          return atom(e.atom);
+        case "letrec":
+          for (const b of e.bindings) binders.add(b.name);
+          for (const b of e.bindings) atom(b.lam);
+          e = e.body;
+          continue;
+        case "if":
+          atom(e.cond);
+          walk(e.then);
+          e = e.else;
+          continue;
+        case "tailcall":
+          atom(e.fn);
+          e.args.forEach(atom);
+          return;
+        case "throw":
+          return atom(e.val);
+        case "nondet": {
+          const alts = e.alts;
+          for (let i = 0; i + 1 < alts.length; i++) walk(alts[i]!);
+          if (alts.length === 0) return;
+          e = alts[alts.length - 1]!;
+          continue;
+        }
+      }
+    }
+  };
+
+  walk(lam.body);
+  for (const b of binders) refs.delete(b);
+  fvLamCache.set(lam, refs);
+  return refs;
 }

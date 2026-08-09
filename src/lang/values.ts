@@ -15,6 +15,7 @@
  */
 
 import type { Keyable } from "../data/key.js";
+import { memoKey } from "../data/key.js";
 import { FinSet, powersetLattice } from "../data/finset.js";
 import type { JoinSemilattice } from "../lattice.js";
 import type { BinOp, ImportSummary, Lit, UnOp } from "./core.js";
@@ -842,7 +843,7 @@ export function abstractDomain<Ctx>(
         fnSumsL.lte(a.fnSums, b.fnSums)),
   };
 
-  const key: Keyable<AVal<Ctx>> = {
+  const key: Keyable<AVal<Ctx>> = memoKey({
     key: (v) =>
       v.topP
         ? "⊤"
@@ -857,7 +858,7 @@ export function abstractDomain<Ctx>(
         `i:{${[...v.intrinsics].sort().join(",")}}`,
         `f:{${[...v.fnSums].map(fnSummaryK.key).sort().join(",")}}`,
       ].join("|"),
-  };
+  });
 
   // An import summary's per-type component as a ConstSet: `"any"` (or a
   // constant list past the widening bound) is the type's ⊤.  (`??`-free:

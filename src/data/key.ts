@@ -13,6 +13,36 @@ export interface Keyable<A> {
   readonly key: (a: A) => string;
 }
 
+/**
+ * Memoize a {@link Keyable} per value object.  Canonical keys are pure
+ * functions of immutable structural values, but the hot dictionaries
+ * (avals, konts, abstract objects) re-render them on every set/map
+ * probe — the self-hosted oracle's dominant allocation, hash, and
+ * compare load.  The memo keys on object identity (a plain `Map`:
+ * object keys hash by identity in both hosts), so the same value
+ * object always returns the SAME string instance and downstream map
+ * probes hit the pointer-equality fast path.  Primitives pass through
+ * unmemoized.  Lifetime: the memo lives exactly as long as the
+ * Keyable instance — the factories mint per-analysis instances, and
+ * the keyed values are retained by the analysis's own seen-sets
+ * anyway, so the memo adds no new retention class.
+ */
+export function memoKey<A>(K: Keyable<A>): Keyable<A> {
+  const memo = new Map<object, string>();
+  return {
+    key: (a) => {
+      if ((typeof a !== "object" || a === null) && typeof a !== "function") return K.key(a);
+      const o = a as unknown as object;
+      let k = memo.get(o);
+      if (k === undefined) {
+        k = K.key(a);
+        memo.set(o, k);
+      }
+      return k;
+    },
+  };
+}
+
 /** Key by JSON serialization with sorted object keys (order-independent). */
 export function jsonKey<A>(): Keyable<A> {
   return { key: (a) => canonicalJson(a) };

@@ -17,6 +17,7 @@
  */
 
 import type { Keyable } from "../data/key.js";
+import { memoKey } from "../data/key.js";
 import { FinMap } from "../data/finmap.js";
 import { FinSet, powersetLattice } from "../data/finset.js";
 import type { JoinSemilattice } from "../lattice.js";
@@ -280,7 +281,7 @@ export function makeMachine<D>(
     rec.ret = DJ.join(rec.ret, v);
   }
 
-  const controlKey: Keyable<ControlState<Ctx>> = {
+  const controlKey: Keyable<ControlState<Ctx>> = memoKey({
     // Under the state cap, drop the environment id from the key: at k=0 the
     // environment is determined by the control location, so distinct (path-dependent)
     // env ids at the same point are spurious — merging them is sound and removes a
@@ -289,7 +290,7 @@ export function makeMachine<D>(
       stateCap > 0
         ? `‹${c.control.loc}|${kak.key(c.kaddr)}|${time.key.key(c.time)}›`
         : `‹${c.control.loc}|${envK.key(c.env)}|${kak.key(c.kaddr)}|${time.key.key(c.time)}›`,
-  };
+  });
 
   /** Pure atomic evaluation — never steps, never branches. */
   function atomEval(a: AExp, env: Env<Ctx>, store: Store<Ctx, D>): D {

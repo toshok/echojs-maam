@@ -37,8 +37,8 @@ import { spanOf } from "./ast.js";
 
 /** A top-level item: an ordinary statement or an ES module declaration. */
 type Stmt = Statement | ModuleDeclaration;
-import type { AExp, BinOp, Expr, Lit, Loc, Name, RHS, UnOp } from "./core.js";
-import { Fresh, litBigint, litBool, litNull, litNum, litStr, litTop, litUndef, thisVarName } from "./core.js";
+import type { AExp, BinOp, Expr, ImportSummary, Lit, Loc, Name, RHS, UnOp } from "./core.js";
+import { Fresh, litBigint, litBool, litNull, litNum, litStr, litSummary, litTop, litUndef, thisVarName } from "./core.js";
 
 export class NormalizeError extends Error {
   constructor(message: string) {
@@ -81,8 +81,114 @@ export interface DegradedBinding {
 /** Owner id for top-level code (not inside any function). */
 export const TOPLEVEL: Loc = -1;
 
+/**
+ * Host hooks into normalization.  `importValue` is cross-module linking
+ * (docs/cross-module-summaries.md): given an ImportDeclaration's source
+ * specifier (verbatim — the HOST resolves it, since module resolution is
+ * the host's) and the imported export name (`"default"` for a default
+ * import), return the exporting module's {@link ImportSummary} for that
+ * binding, or `undefined` when none exists.  A miss binds `⊤` and records
+ * a degraded binding — exactly the hook-less behavior — so correctness
+ * never depends on the host's registry being complete.
+ */
+export interface ImportHooks {
+  importValue?(source: string, imported: string): ImportSummary | undefined;
+}
+
+/** Options for {@link normalizeProgram} beyond the hooks. */
+export interface NormalizeOptions {
+  /**
+   * Inject the EXPORT HARNESS: after the real toplevel, a `letrec`
+   * nondeterministic LOOP that calls every syntactically-function export
+   * with `⊤` arguments and re-enters itself.  Its fixpoint over-approximates
+   * every external call sequence — repetition included, which a single
+   * straight-line ⊤-call would NOT (module state like `count++` needs the
+   * ascent) — so the harness call results (`exportResultNames`) are sound
+   * ⊤-argument result summaries.  The harness also joins ⊤ into exported
+   * functions' parameters, so a harness run's node types are WIDER than the
+   * plain run's: use a separate plain analysis for the type oracle.
+   */
+  readonly exportHarness?: boolean;
+}
+
+/** A syntactically-function export: the harness knows its arity statically. */
+interface FnExport {
+  readonly exportName: string;
+  readonly localName: string;
+  readonly arity: number;
+}
+
+/**
+ * The exports whose FUNCTION-ness is syntactically evident: exported
+ * function declarations, exported `const f = function/arrow`, export
+ * specifiers naming such toplevel declarations, and a NAMED default
+ * function.  (An export whose function-ness is only semantic — `export
+ * const f = compose(g, h)` — is not harnessed and gets no result summary.)
+ */
+export function collectFnExports(body: ReadonlyArray<Node>): FnExport[] {
+  const fnDecls = new Map<string, number>();
+  const declFromStmt = (s: Node): void => {
+    const st = s as { type?: string } & Record<string, unknown>;
+    if (st.type === "FunctionDeclaration") {
+      const d = s as FunctionDeclaration;
+      if (d.id) fnDecls.set(d.id.name, d.params.length);
+    } else if (st.type === "VariableDeclaration") {
+      const decls = (st.declarations as Array<{ id?: { type?: string; name?: string }; init?: { type?: string; params?: unknown[] } }>) ?? [];
+      for (const d of decls) {
+        if (
+          d.id?.type === "Identifier" &&
+          d.id.name !== undefined &&
+          d.init &&
+          (d.init.type === "FunctionExpression" || d.init.type === "ArrowFunctionExpression")
+        )
+          fnDecls.set(d.id.name, (d.init.params ?? []).length);
+      }
+    }
+  };
+  for (const s of body) {
+    const st = s as { type?: string; declaration?: Node | null };
+    if (st.type === "ExportNamedDeclaration" && st.declaration) declFromStmt(st.declaration);
+    else declFromStmt(s);
+  }
+  const out: FnExport[] = [];
+  const seen = new Set<string>();
+  const add = (exportName: string, localName: string): void => {
+    const arity = fnDecls.get(localName);
+    if (arity === undefined || seen.has(exportName)) return;
+    seen.add(exportName);
+    out.push({ exportName, localName, arity });
+  };
+  for (const s of body) {
+    const st = s as {
+      type?: string;
+      declaration?: Node | null;
+      specifiers?: Array<{ local: { name: string }; exported: { name: string } }>;
+      source?: unknown;
+    };
+    if (st.type === "ExportNamedDeclaration") {
+      if (st.declaration) {
+        const d = st.declaration as { type?: string; id?: { name?: string }; declarations?: Array<{ id?: { type?: string; name?: string } }> };
+        if (d.type === "FunctionDeclaration" && d.id?.name !== undefined) add(d.id.name, d.id.name);
+        else if (d.type === "VariableDeclaration")
+          for (const dd of d.declarations ?? [])
+            if (dd.id?.type === "Identifier" && dd.id.name !== undefined) add(dd.id.name, dd.id.name);
+      } else if (!st.source) {
+        for (const spec of st.specifiers ?? []) add(spec.exported.name, spec.local.name);
+      }
+    } else if (st.type === "ExportDefaultDeclaration") {
+      const d = (s as { declaration?: { type?: string; id?: { name?: string } | null } }).declaration;
+      if (d && d.type === "FunctionDeclaration" && d.id?.name !== undefined) add("default", d.id.name);
+    }
+  }
+  return out;
+}
+
 /** Normalize a whole program to a single core expression. */
-export function normalizeProgram(program: Program): {
+export function normalizeProgram(
+  program: Program,
+  hooks?: ImportHooks,
+  opts?: NormalizeOptions,
+): {
   core: Expr;
   fresh: Fresh;
   /** Object allocation-site / `new`-site location → its source span. */
@@ -97,22 +203,100 @@ export function normalizeProgram(program: Program): {
   degradedBindings: ReadonlyArray<DegradedBinding>;
   /** Source node → core name holding its value (see Normalizer.nodeNames). */
   nodeNames: ReadonlyMap<Node, Name>;
+  /**
+   * The toplevel lexical scope at the end of the program: source name →
+   * unique core name.  The export side of cross-module linking — this is
+   * where `summarizeBinding` finds an exported binding's core identity.  A
+   * source name whose final unique name differs across toplevel control
+   * paths is omitted (ambiguous — no summary rather than a wrong one).
+   */
+  toplevelScope: ReadonlyMap<string, Name>;
+  /** How many import bindings were bound from a host-supplied summary. */
+  summaryBindings: number;
+  /** Checked-tier import sites: synthetic loc → import label + declared shape. */
+  importShapeSites: ReadonlyMap<Loc, { label: string; fields: ReadonlyArray<{ name: string; sig: string }> }>;
+  /**
+   * Export-harness result bindings: export name → the core names its
+   * ⊤-argument harness call results bind to (one per harness copy — a
+   * branching toplevel materializes the shared final continuation more than
+   * once; extraction joins across all of them).  Empty without
+   * {@link NormalizeOptions.exportHarness}.
+   */
+  exportResultNames: ReadonlyMap<string, ReadonlyArray<Name>>;
 } {
   const fresh = new Fresh();
-  const n = new Normalizer(fresh);
+  const n = new Normalizer(fresh, hooks);
   // Empty statements are no-ops; drop them so a trailing `;` doesn't hide the
   // program's result-bearing final expression statement.
   const body = program.body.filter(isStatement).filter((s) => s.type !== "EmptyStatement");
+  // The final continuation records the toplevel scope it is built with.  It
+  // can run more than once (a shared continuation spliced into several
+  // branch arms); entries that disagree between runs are ambiguous.
+  const toplevel = new Map<string, Name>();
+  const ambiguous = new Set<string>();
+  const recordToplevel = (scope: Scope): void => {
+    for (const [src, unique] of scope) {
+      const prev = toplevel.get(src);
+      if (prev === undefined) toplevel.set(src, unique);
+      else if (prev !== unique) ambiguous.add(src);
+    }
+  };
+  // The export harness (see NormalizeOptions.exportHarness): appended to
+  // every materialization of the final continuation so no completion path
+  // escapes it.
+  const fnExports = opts?.exportHarness === true ? collectFnExports(program.body) : [];
+  const exportResultNames = new Map<string, Name[]>();
+  const withHarness = (scope: Scope, completion: Expr): Expr => {
+    if (fnExports.length === 0) return completion;
+    const harnessName = fresh.name("exharness");
+    const arms: Expr[] = [];
+    for (const fe of fnExports) {
+      const unique = scope.get(fe.localName);
+      if (unique === undefined) continue;
+      const resName = fresh.name("exres");
+      const names = exportResultNames.get(fe.exportName);
+      if (names) names.push(resName);
+      else exportResultNames.set(fe.exportName, [resName]);
+      const args: AExp[] = [];
+      for (let i = 0; i < fe.arity; i++) args.push(n.litA(litTop));
+      arms.push(
+        n.letE(
+          resName,
+          { tag: "call", loc: fresh.loc(), fn: n.varA(unique), args },
+          { tag: "tailcall", loc: fresh.loc(), fn: n.varA(harnessName), args: [] },
+        ),
+      );
+    }
+    if (arms.length === 0) return completion;
+    const harnessBody: Expr = arms.length === 1 ? arms[0]! : { tag: "nondet", loc: fresh.loc(), alts: arms };
+    return {
+      tag: "letrec",
+      loc: fresh.loc(),
+      bindings: [{ name: harnessName, lam: n.lamA([], harnessBody) }],
+      body: {
+        tag: "nondet",
+        loc: fresh.loc(),
+        alts: [completion, { tag: "tailcall", loc: fresh.loc(), fn: n.varA(harnessName), args: [] }],
+      },
+    };
+  };
   // The program's "result" is the value of a trailing expression statement, if
   // any; otherwise the program yields `undefined`.
   const last = body[body.length - 1];
   let core: Expr;
   if (last && last.type === "ExpressionStatement") {
     const init = body.slice(0, -1);
-    core = n.normStmts(init, new Map(), (scope) => n.normAtom(last.expression, scope, (a) => n.retE(a)));
+    core = n.normStmts(init, new Map(), (scope) => {
+      recordToplevel(scope);
+      return withHarness(scope, n.normAtom(last.expression, scope, (a) => n.retE(a)));
+    });
   } else {
-    core = n.normStmts(body, new Map(), () => n.retE(n.litA(litUndef)));
+    core = n.normStmts(body, new Map(), (scope) => {
+      recordToplevel(scope);
+      return withHarness(scope, n.retE(n.litA(litUndef)));
+    });
   }
+  for (const name of ambiguous) toplevel.delete(name);
   return {
     core,
     fresh,
@@ -122,6 +306,10 @@ export function normalizeProgram(program: Program): {
     lambdaParams: n.lambdaParams,
     degradedBindings: n.degradedBindings,
     nodeNames: n.nodeNames,
+    toplevelScope: toplevel,
+    summaryBindings: n.summaryBindings,
+    importShapeSites: n.importShapeSites,
+    exportResultNames,
   };
 }
 
@@ -178,7 +366,21 @@ class Normalizer {
   /** Enclosing loops, innermost last — targets for `break`/`continue`. */
   private readonly loopStack: Array<{ onBreak: () => Expr; onContinue: () => Expr }> = [];
 
-  constructor(private readonly fresh: Fresh) {}
+  /** Count of import bindings bound from a host-supplied summary. */
+  summaryBindings = 0;
+  /**
+   * Checked-tier import allocation sites: the synthetic `shapedTop` loc →
+   * the import it stands for (`source#exportName`) and its declared shape.
+   * The analysis compares each site's FINAL heap state against the
+   * declaration to report which imported objects this module mutates
+   * (`AnalysisResult.mutatedImports`).
+   */
+  readonly importShapeSites = new Map<Loc, { label: string; fields: ReadonlyArray<{ name: string; sig: string }> }>();
+
+  constructor(
+    private readonly fresh: Fresh,
+    private readonly hooks?: ImportHooks,
+  ) {}
 
   /** Nodes spliced into multiple binding sites — poisoned, never reported. */
   private readonly poisonedNodes = new Set<Node>();
@@ -251,6 +453,18 @@ class Normalizer {
    * list are hoisted into a leading `letrec`.
    */
   normStmts(stmts: ReadonlyArray<Stmt>, scope: Scope, k: (scope: Scope) => Expr): Expr {
+    // Import bindings are HOISTED by spec: they exist (and are initialized —
+    // the exporting module runs first) before any statement of this module.
+    // Bind them ABOVE everything else, so hoisted function declarations'
+    // closures capture the import addresses; a hoisted function that
+    // references an import would otherwise read `⊥` (free variable), and
+    // summaries would never reach function bodies — which is where imports
+    // are actually used.
+    const imports = stmts.filter((s) => s.type === "ImportDeclaration");
+    if (imports.length > 0 && imports.length !== stmts.length) {
+      const others = stmts.filter((s) => s.type !== "ImportDeclaration");
+      return this.normStmts(imports, scope, (sc) => this.normStmts(others, sc, k));
+    }
     const allFuncs = stmts.filter((s): s is FunctionDeclaration => s.type === "FunctionDeclaration");
     // async/generator functions are not modeled: their name binds ⊤ (a call
     // then degrades as an unknown call), their body is never compiled, and
@@ -575,36 +789,70 @@ class Normalizer {
         return this.normTry(s, scope, k);
       // --- modules (EchoJS desugars these; handled here for robustness) --------
       case "ImportDeclaration": {
-        // Bind imported names to ⊤ (an import is a real value we know nothing
-        // about — binding `undefined` would be unsound as a *type*), and record
-        // each one: an imports-only-degraded module must not read as a closed
-        // world. The real analysis of a multi-module program links exports;
-        // that is future work.
+        // Cross-module linking: bind an imported name to the exporting
+        // module's summary when the host's `importValue` hook supplies one
+        // (a namespace specifier asks for the whole module as `"*"`).
+        // Otherwise bind ⊤ (an import is a real value we know nothing about
+        // — binding `undefined` would be unsound as a *type*) and record the
+        // degradation: an imports-only-degraded module must not read as a
+        // closed world, and the degraded-binding count keeps measuring the
+        // residual ⊤ imports.
+        const source = s.source && typeof s.source.value === "string" ? s.source.value : undefined;
         let sc = scope;
+        const bindings: Array<{ unique: Name; summary?: ImportSummary; span: Span; label: string }> = [];
         for (const spec of s.specifiers) {
           const local = spec.local.name;
           const unique = this.fresh.name(local);
           this.mapNode(spec.local, unique);
           sc = new Map(sc).set(local, unique);
-          this.degradedBindings.push({
-            name: local,
-            reason: "unmodeled import — bound to ⊤; cross-module linking is not analyzed",
-            span: spanOf(spec),
-          });
+          // The export name this specifier views ("*" = the namespace).
+          const imported =
+            spec.type === "ImportSpecifier"
+              ? spec.imported.type === "Identifier"
+                ? spec.imported.name
+                : String(spec.imported.value)
+              : spec.type === "ImportDefaultSpecifier"
+                ? "default"
+                : "*";
+          const answered = source !== undefined ? this.hooks?.importValue?.(source, imported) : undefined;
+          // a namespace is by definition an object: only the object form is
+          // acceptable for "*" (a primitive answer would be a host bug —
+          // treat it as a miss rather than bind nonsense)
+          const summary = imported === "*" && answered !== undefined && answered.fields === undefined
+            ? undefined
+            : answered;
+          const label = `${source ?? "?"}#${imported}`;
+          if (summary !== undefined) {
+            this.summaryBindings++;
+            bindings.push({ unique, summary, span: spanOf(spec), label });
+          } else {
+            this.degradedBindings.push({
+              name: local,
+              reason: "unmodeled import — bound to ⊤; no export summary for this binding",
+              span: spanOf(spec),
+            });
+            bindings.push({ unique, span: spanOf(spec), label });
+          }
         }
-        const go = (i: number, sci: Scope): Expr => {
-          if (i >= s.specifiers.length) return k(sci);
-          const unique = sci.get(s.specifiers[i]!.local.name)!;
-          return this.letE(unique, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litTop) }, go(i + 1, sci));
+        const go = (i: number): Expr => {
+          if (i >= bindings.length) return k(sc);
+          const b = bindings[i]!;
+          if (b.summary === undefined)
+            return this.letE(b.unique, { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litTop) }, go(i + 1));
+          return this.bindImportSummary(b.unique, b.summary, b.span, go(i + 1), b.label);
         };
-        return go(0, sc);
+        return go(0);
       }
       case "ExportNamedDeclaration":
         // `export const x = …` → analyze the declaration; `export { a }` → no-op.
         return s.declaration ? this.normStmt(s.declaration, scope, k) : k(scope);
       case "ExportDefaultDeclaration": {
-        const d = s.declaration;
-        if (d.type === "FunctionDeclaration" || d.type === "ClassDeclaration")
+        // A statement-shaped declaration: function/class declarations, and
+        // the `let X = (classIIFE)()` a class desugars to (EchoJS runs its
+        // class desugar before analysis, so `export default class` arrives
+        // as a VariableDeclaration — outside ESTree's declared union).
+        const d = s.declaration as Statement | EExpr;
+        if (d.type === "FunctionDeclaration" || d.type === "ClassDeclaration" || d.type === "VariableDeclaration")
           return this.normStmt(d as Statement, scope, k);
         return this.normAtom(d as EExpr, scope, () => k(scope)); // export default <expr>
       }
@@ -615,6 +863,68 @@ class Normalizer {
       default:
         throw new NormalizeError(`unsupported statement: ${s.type}`);
     }
+  }
+
+  /**
+   * Bind `unique` to an import summary's value, then continue with `rest`.
+   * A primitive summary is a `Lit` atom; an OBJECT summary (`fields` — an
+   * immutable field set, i.e. a module namespace) materializes as a
+   * synthetic object literal at a fresh allocation site, so the importing
+   * analysis interns its hidden class and tracks its fields exactly like a
+   * local object; a CHECKED-TIER shape summary (`shape` — a mutable
+   * exported object) materializes as an OPEN object with the declared
+   * hidden class and `⊤` field values.  Nested object fields bind to temps
+   * first (object fields are atoms).  `label` names the import
+   * (`source#exportName`) for the mutated-imports report.
+   */
+  /** Default a callable summary's program-wide id to its import label. */
+  private withFnId(s: ImportSummary, label: string): ImportSummary {
+    if (s.fn === undefined || s.fn.id !== undefined) return s;
+    return { ...s, fn: { ...s.fn, id: label } };
+  }
+
+  private bindImportSummary(unique: Name, s: ImportSummary, span: Span, rest: Expr, label: string): Expr {
+    if (s.fields) {
+      const fieldAtoms: Array<readonly [string, AExp]> = [];
+      const nested: Array<{ unique: Name; summary: ImportSummary; label: string }> = [];
+      for (const f of s.fields) {
+        if (f.value !== undefined && (f.value.fields !== undefined || f.value.shape !== undefined)) {
+          const t = this.fresh.name(f.name);
+          nested.push({ unique: t, summary: f.value, label: `${label}.${f.name}` });
+          fieldAtoms.push([f.name, this.varA(t)]);
+        } else {
+          fieldAtoms.push([
+            f.name,
+            this.litA(
+              f.value !== undefined ? litSummary(this.withFnId(f.value, `${label}.${f.name}`)) : litTop,
+            ),
+          ]);
+        }
+      }
+      const objLoc = this.fresh.loc();
+      this.siteSpans.set(objLoc, span);
+      let out: Expr = this.letE(unique, { tag: "obj", loc: objLoc, fields: fieldAtoms }, rest);
+      for (let i = nested.length - 1; i >= 0; i--) {
+        const n = nested[i]!;
+        out = this.bindImportSummary(n.unique, n.summary, span, out, n.label);
+      }
+      return out;
+    }
+    if (s.shape) {
+      const objLoc = this.fresh.loc();
+      this.siteSpans.set(objLoc, span);
+      this.importShapeSites.set(objLoc, { label, fields: s.shape });
+      return this.letE(
+        unique,
+        { tag: "shapedTop", loc: objLoc, fields: s.shape.map((f) => [f.name, f.sig] as const) },
+        rest,
+      );
+    }
+    return this.letE(
+      unique,
+      { tag: "atom", loc: this.fresh.loc(), atom: this.litA(litSummary(this.withFnId(s, label))) },
+      rest,
+    );
   }
 
   /**

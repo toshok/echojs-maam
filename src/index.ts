@@ -32,8 +32,9 @@ export * from "./driver.js";
 export * as ast from "./lang/ast.js";
 export { checkRestrictions, assertRestrictions, RestrictionError } from "./lang/restrictions.js";
 export type { Violation } from "./lang/restrictions.js";
-export { normalizeProgram, NormalizeError } from "./lang/normalize.js";
-export type { DegradedBinding } from "./lang/normalize.js";
+export { collectFnExports, normalizeProgram, NormalizeError } from "./lang/normalize.js";
+export type { DegradedBinding, ImportHooks, NormalizeOptions } from "./lang/normalize.js";
+export type { ImportSummary } from "./lang/core.js";
 export * from "./lang/values.js";
 export { makeMachine } from "./lang/machine.js";
 export type { ContextStrategy, ControlState, Machine } from "./lang/machine.js";
@@ -94,6 +95,7 @@ export function kCFA(
   stateCap = 0,
   counting = false,
   intrinsics = false,
+  iterationBudget = 0,
 ): AnalysisSpec<AVal<Loc>> {
   return {
     domain: (closureK: Keyable<Closure<Loc>>, oaddrK: Keyable<OAddr<Loc>>) =>
@@ -108,5 +110,6 @@ export function kCFA(
     stateCap,
     counting,
     intrinsics,
+    iterationBudget,
   };
 }

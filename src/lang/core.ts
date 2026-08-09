@@ -29,10 +29,66 @@ export type Name = string;
 export const thisVarName = (lamLoc: Loc): Name => `this$${lamLoc}`;
 
 /**
- * Primitive literal values of the dialect, plus the degradation literal `top`:
- * "any value, no information".  `top` is not surface syntax — the normalizer
- * emits it where a value exists but cannot be modeled (unmodeled imports, rest
- * array contents), and the domains map it to their `⊤` element.
+ * A host-neutral, serializable summary of an exported binding's abstract
+ * value — what an import binds instead of `⊤` when the exporting module's
+ * analysis has already run (cross-module linking).  Two mutually exclusive
+ * forms:
+ *
+ *  - **primitive** — the per-type components, each over-approximating the
+ *    binding the way `AVal` does, with `"any"` as the per-type `⊤`;
+ *  - **object** (`fields` present) — a value that is EXACTLY an object
+ *    whose field set is `fields` and cannot change (the host asserts
+ *    immutability — in practice a module NAMESPACE object, whose field
+ *    set is its module's export names and is frozen by spec).  A field's
+ *    `value` is that field's own summary; a field without one holds `⊤`.
+ *    The importing analysis materializes it as a synthetic object literal
+ *    at a fresh allocation site, so shapes re-intern locally for free.
+ *
+ * A binding whose value neither form can express (closures, intrinsics,
+ * bigints, mutable objects, `⊤`) has NO summary — absence, not a lossy
+ * encoding, is the degradation channel, so a present summary is always a
+ * sound, usable fact.
+ */
+export interface ImportSummary {
+  readonly nums?: "any" | ReadonlyArray<number>;
+  readonly strs?: "any" | ReadonlyArray<string>;
+  readonly bools?: ReadonlyArray<boolean>;
+  readonly nullP?: boolean;
+  readonly undefP?: boolean;
+  /** Object form: the exact, immutable field set (order = shape order). */
+  readonly fields?: ReadonlyArray<{ readonly name: string; readonly value?: ImportSummary }>;
+  /**
+   * CHECKED-TIER object form: shape identity only — field names in
+   * insertion order, each with the exporting analysis's {@link TypeSig}
+   * for its representation — and NO value claims (the importer's fields
+   * all hold `⊤`).  For a MUTABLE exported object: other importers may
+   * mutate it, so nothing here may feed an unguarded consumer; a shape
+   * fact is safe because every shape consumer re-checks at runtime
+   * (has_shape), where staleness costs a guard miss, never behavior.
+   */
+  readonly shape?: ReadonlyArray<{ readonly name: string; readonly sig: string }>;
+  /**
+   * CALLABLE form: the export is a function.  `result` is its
+   * ⊤-ARGUMENT result summary — extracted from a harness analysis that
+   * calls every exported function with `⊤` arguments in a repetition
+   * fixpoint (sound for any external call sequence, module-state
+   * effects included); absent = the result is `⊤`.  `id` names the
+   * function across the program (host registry key; the importing
+   * normalizer defaults it to `source#export`).  Calling through a
+   * summary binds the result but still counts as an OPEN-WORLD call
+   * (argument-mutation effects stay unmodeled), and property reads on
+   * the summary value degrade to `⊤`.
+   */
+  readonly fn?: { readonly id?: string; readonly result?: ImportSummary };
+}
+
+/**
+ * Primitive literal values of the dialect, plus two non-surface literals the
+ * normalizer emits: `top` — "any value, no information" — where a value
+ * exists but cannot be modeled (unmodeled imports, rest array contents), and
+ * `summary` — an imported binding's {@link ImportSummary} — where the host
+ * supplied cross-module linking information.  The domains map `top` to their
+ * `⊤` element and `summary` into their lattice (never below the summary).
  */
 export type Lit =
   | { readonly kind: "num"; readonly value: number }
@@ -41,7 +97,8 @@ export type Lit =
   | { readonly kind: "str"; readonly value: string }
   | { readonly kind: "null" }
   | { readonly kind: "undef" }
-  | { readonly kind: "top" };
+  | { readonly kind: "top" }
+  | { readonly kind: "summary"; readonly summary: ImportSummary };
 
 /**
  * Atomic expressions — evaluated by the machine's pure `atomEval`, never
@@ -86,6 +143,14 @@ export type RHS =
   // --- objects (hidden-class heap) ---
   /** Allocate a fresh object with these properties, in order (sets the initial shape). */
   | { readonly tag: "obj"; readonly loc: Loc; readonly fields: ReadonlyArray<readonly [string, AExp]> }
+  /**
+   * Allocate a fresh object with a DECLARED hidden class but unknown field
+   * values: shape = `fields` (name + representation sig, in order), every
+   * field's value `⊤`.  Emitted only for checked-tier import summaries
+   * (a mutable exported object's shape crossing a module boundary): the
+   * shape is a guardable fact, the values deliberately are not.
+   */
+  | { readonly tag: "shapedTop"; readonly loc: Loc; readonly fields: ReadonlyArray<readonly [string, string]> }
   /** Read property `key` from `obj`. */
   | { readonly tag: "get"; readonly loc: Loc; readonly obj: AExp; readonly key: string }
   /** Write `val` to property `key` of `obj` (transitions its shape); result is `val`. */
@@ -181,6 +246,7 @@ export const litStr = (value: string): Lit => ({ kind: "str", value });
 export const litNull: Lit = { kind: "null" };
 export const litUndef: Lit = { kind: "undef" };
 export const litTop: Lit = { kind: "top" };
+export const litSummary = (summary: ImportSummary): Lit => ({ kind: "summary", summary });
 
 /**
  * A monotonic source of fresh locations and names, threaded through
@@ -215,6 +281,16 @@ export function litToString(l: Lit): string {
       return "undefined";
     case "top":
       return "⊤";
+    case "summary": {
+      const s = l.summary;
+      const parts: string[] = [];
+      if (s.nums) parts.push(s.nums === "any" ? "num" : s.nums.join("|"));
+      if (s.strs) parts.push(s.strs === "any" ? "str" : s.strs.map((x) => JSON.stringify(x)).join("|"));
+      if (s.bools) parts.push(s.bools.join("|"));
+      if (s.nullP) parts.push("null");
+      if (s.undefP) parts.push("undefined");
+      return `summary⟨${parts.join("|")}⟩`;
+    }
   }
 }
 
@@ -241,6 +317,8 @@ export function rhsToString(r: RHS): string {
       return `${aexpToString(r.fn)}(${r.args.map(aexpToString).join(", ")})`;
     case "obj":
       return `{${r.fields.map(([k, v]) => `${k}: ${aexpToString(v)}`).join(", ")}}`;
+    case "shapedTop":
+      return `shaped⟨${r.fields.map(([k, sig]) => `${k}: ${sig}`).join(", ")}⟩`;
     case "get":
       return `${aexpToString(r.obj)}.${r.key}`;
     case "put":
@@ -368,6 +446,8 @@ export function freeVarsOfLam(lam: Lam): ReadonlySet<Name> {
       case "obj":
         for (const [, v] of r.fields) atom(v);
         return;
+      case "shapedTop":
+        return; // declared shape, no operands
       case "array":
         r.elems.forEach(atom);
         return;

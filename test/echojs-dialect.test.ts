@@ -571,3 +571,18 @@ test("for-of over an element bucket containing closures degrades (hand-rolled it
   assert.equal(r.domain.typeSig(r.valueOfVar("x")), "\u22a4");
   assert.ok(r.metrics.unknownCalls >= 1);
 });
+
+test("export default of a desugared class (a VariableDeclaration) analyzes as a statement", () => {
+  // EchoJS desugars `export default class X {…}` to `export default let X =
+  // (function(){…})()` BEFORE analysis, so the declaration reaches the
+  // normalizer as a VariableDeclaration — outside ESTree's declared union
+  // for ExportDefaultDeclaration.  It must bind like any toplevel statement,
+  // not crash normalization.
+  const prog = program([
+    { type: "ExportDefaultDeclaration", declaration: varDecl("X", lit(42)) },
+    exprStmt(id("X")),
+  ]);
+  const r = analyzeAbstract(prog);
+  assert.equal(r.domain.typeSig(r.valueOfVar("X")), "num");
+  assert.deepEqual(r.summarizeBinding("X"), { nums: [42] });
+});

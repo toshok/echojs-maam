@@ -25,7 +25,7 @@ import { mplusAll } from "../monad/monad.js";
 import type { TimeDict, Time } from "../time.js";
 import type { AExp, Expr, Loc, Name, RHS } from "./core.js";
 import { freeVarsOfLam, litBool, litNull, litNum, litStr, litUndef, thisVarName } from "./core.js";
-import type { Prim, ValDomain } from "./values.js";
+import type { FnSummary, Prim, ValDomain } from "./values.js";
 import type { ACount, Addr, AbsObject, Closure, KAddr, Kont, OAddr, Store } from "./state.js";
 import {
   Env,
@@ -96,6 +96,8 @@ export interface Machine<Ctx, D> {
    * set should be *empty*; a non-empty set is a soundness caveat, not a fact.
    */
   readonly unknownCallSites: ReadonlySet<Loc>;
+  /** The subset of open-world call sites that bound a cross-module summary's result. */
+  readonly summarizedCallSites: ReadonlySet<Loc>;
   /**
    * Cap-saturation telemetry: how often (and where) convergence was *forced* by
    * a widening cap rather than reached naturally. `stateCapHits` counts calls
@@ -223,6 +225,18 @@ export function makeMachine<D>(
   const capStats = { stateCapHits: 0, stateCapFuncs: new Set<Loc>(), shapeCapHits: 0 };
   function recordUnknownCall(loc: Loc): void {
     unknownCallSites.add(loc);
+  }
+
+  /**
+   * Sites that dispatched through a cross-module callable summary.  These
+   * ALSO count as unknown calls (the callee's effects on its arguments are
+   * unmodeled — the open-world bit must stay honest); this set tracks how
+   * many of the open-world calls at least bound a summarized result.
+   */
+  const summarizedCallSites = new Set<Loc>();
+  function recordSummarizedCall(loc: Loc): void {
+    recordUnknownCall(loc);
+    summarizedCallSites.add(loc);
   }
 
   /** Constructor call graph: constructor-function loc → the `new`-site locs invoking it. */
@@ -376,6 +390,43 @@ export function makeMachine<D>(
       objs: n === ONE ? objs.set(oaddr, obj) : objs.joinAt(objLat, oaddr, obj),
       counts: counts.set(oaddr, n),
     };
+  }
+
+  /**
+   * The value a call through a callable summary binds: the summary's
+   * ⊤-argument result.  An OBJECT result (shape form) materializes as an
+   * OPEN object at the CALL SITE — a per-site allocation, so each caller's
+   * own mutations are tracked locally; aliasing BETWEEN callers is the
+   * checked-tier story (shape facts are runtime-guarded, field values are
+   * already `⊤`).  A primitive result maps through the summary lit; no
+   * result payload means `⊤`.
+   */
+  function fnSummaryResult(
+    fs: FnSummary,
+    loc: Loc,
+    t: Time<Ctx>,
+    objs0: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>,
+    counts0: FinMap<OAddr<Ctx>, ACount>,
+  ): { v: D; objs: FinMap<OAddr<Ctx>, AbsObject<Ctx, D>>; counts: FinMap<OAddr<Ctx>, ACount> } {
+    const r = fs.result;
+    if (r === undefined || r.fields !== undefined)
+      return { v: domain.top, objs: objs0, counts: counts0 };
+    if (r.shape !== undefined) {
+      const oaddr: OAddr<Ctx> = { loc, time: t };
+      let fields = FinMap.empty<PropName, D>(propK);
+      for (const f of r.shape) fields = fields.joinAt(DJ, f.name, domain.top);
+      const shape = shapes.fromFields(r.shape.map((f) => [f.name, f.sig] as const));
+      const alloc = installObj(objs0, counts0, oaddr, {
+        shapes: FinSet.of(shapeKey, shape),
+        fields,
+        accessors: FinMap.empty(propK),
+        proto: FinSet.empty(oak),
+        elements: DJ.bot,
+        open: true, // the callee (or another caller) may have added fields
+      });
+      return { v: domain.objRef(oaddr), objs: alloc.objs, counts: alloc.counts };
+    }
+    return { v: domain.lit({ kind: "summary", summary: r }), objs: objs0, counts: counts0 };
   }
 
   // --- standard-library intrinsics (Phase 1: pure statics + Array/Object alloc) ---
@@ -870,6 +921,10 @@ export function makeMachine<D>(
     if (domain.isTop(objVal)) return domain.top;
     let result = DJ.bot;
 
+    // An imported function (callable summary): its properties live in another
+    // module — any read is any value, never a confident `undefined`.
+    if (!domain.elimFnSummary(objVal).isEmpty()) result = DJ.join(result, domain.top);
+
     // `F.prototype` — a property read on a function value.
     if (key === "prototype") {
       for (const clo of domain.elimClo(objVal)) result = DJ.join(result, domain.objRef(protoAddr(clo.loc)));
@@ -894,7 +949,11 @@ export function makeMachine<D>(
       const mayLack = obj.shapes.isEmpty() || obj.shapes.toArray().some((s) => isMegamorphic(s) || !shapeHas(s, key));
       if (hasKey) r = DJ.join(r, obj.fields.getOr(key, DJ.bot)); // own property shadows the chain
       if (mayLack) {
-        if (obj.proto.isEmpty()) r = DJ.join(r, domain.lit(litUndef)); // end of chain, not found
+        // An OPEN object may carry untracked fields (a checked-tier import —
+        // other modules can mutate it): a miss is any value, never a
+        // closed-world `undefined`.
+        if (obj.open) r = DJ.join(r, domain.top);
+        else if (obj.proto.isEmpty()) r = DJ.join(r, domain.lit(litUndef)); // end of chain, not found
         else for (const p of obj.proto) r = DJ.join(r, lookup(p));
       }
       return r;
@@ -928,6 +987,9 @@ export function makeMachine<D>(
     let setters = DJ.bot;
     let sawUndefined = false;
 
+    // an imported function's properties live in another module: any value
+    if (!domain.elimFnSummary(objVal).isEmpty()) data = DJ.join(data, domain.top);
+
     // `F.prototype` on a function value resolves to that function's prototype object.
     if (key === "prototype") {
       for (const clo of domain.elimClo(objVal)) data = DJ.join(data, domain.objRef(protoAddr(clo.loc)));
@@ -957,7 +1019,9 @@ export function makeMachine<D>(
       const mayLack =
         !hasAcc && (obj.shapes.isEmpty() || obj.shapes.toArray().some((s) => isMegamorphic(s) || !shapeHas(s, key)));
       if (mayLack) {
-        if (obj.proto.isEmpty()) sawUndefined = true;
+        // open object: a miss reads as ⊤, never the closed-world `undefined`
+        if (obj.open) data = DJ.join(data, domain.top);
+        else if (obj.proto.isEmpty()) sawUndefined = true;
         else for (const p of obj.proto) walk(p);
       }
     };
@@ -1000,6 +1064,7 @@ export function makeMachine<D>(
           accessors: existing.accessors,
           proto: existing.proto, // writes are own-only; prototype link is unchanged
           elements: existing.elements,
+          ...(existing.open ? { open: true } : {}),
         });
       } else {
         // Weak update: keep the old *and* transitioned shapes — but cap the set so
@@ -1014,10 +1079,61 @@ export function makeMachine<D>(
           accessors: existing.accessors,
           proto: existing.proto,
           elements: existing.elements,
+          ...(existing.open ? { open: true } : {}),
         });
       }
     }
     return out;
+  }
+
+  /**
+   * Deliver `v` to every continuation at `kaddr` — the shared tail of a
+   * `ret` step.  Also used to return a callable summary's result at a TAIL
+   * call (the summary has no body to enter, so the "return" happens at the
+   * call itself).
+   */
+  function returnToKont(
+    M: AnalysisMonad<Store<Ctx, D>>,
+    v: D,
+    kaddr: KAddr<Ctx>,
+    store: Store<Ctx, D>,
+  ): Comp<ControlState<Ctx>> {
+    const konts = store.konts.getOr(kaddr, FinSet.empty(kontK));
+    return mplusAll(
+      M,
+      konts.toArray().map((k): Comp<ControlState<Ctx>> => {
+        if (k.tag === "halt") return M.mzero(); // final state: no successor
+        // A `collect` frame (`Array.map`) weak-adds the callback's return to
+        // the result array's elements and binds *that array* to `name`.
+        let objs = store.objs;
+        let resultVal: D;
+        if (k.collect) {
+          const arr = objs.getOr(k.collect, objLat.bot);
+          objs = objs.set(k.collect, { ...arr, elements: DJ.join(arr.elements, v) });
+          resultVal = domain.objRef(k.collect);
+        } else {
+          // For a `new` frame the result is the returned value when it is an
+          // object, otherwise the freshly-constructed `this` object.
+          resultVal = k.newObj && domain.elimObj(v).isEmpty() ? domain.objRef(k.newObj) : v;
+        }
+        // Restore the caller's time captured in the frame, and bind the
+        // returned value in the caller's context (not the callee's).
+        const bound = bindVar(k.env, store.vals, k.name, resultVal, k.time);
+        const store2: Store<Ctx, D> = {
+          vals: bound.vals,
+          konts: store.konts,
+          objs,
+          counts: store.counts,
+        };
+        const successor: ControlState<Ctx> = {
+          control: k.body,
+          env: bound.env,
+          kaddr: k.next,
+          time: k.time,
+        };
+        return M.bind(M.put(store2), () => M.unit(successor));
+      }),
+    );
   }
 
   /**
@@ -1187,42 +1303,7 @@ export function makeMachine<D>(
             const v = atomEval(e.atom, c.env, store);
             const owner = retOwner.get(e.loc);
             if (owner !== undefined) recordSpecReturn(owner, c.time, v); // observe this specialization's return
-            const konts = store.konts.getOr(c.kaddr, FinSet.empty(kontK));
-            return mplusAll(
-              M,
-              konts.toArray().map((k): Comp<ControlState<Ctx>> => {
-                if (k.tag === "halt") return M.mzero(); // final state: no successor
-                // A `collect` frame (`Array.map`) weak-adds the callback's return to
-                // the result array's elements and binds *that array* to `name`.
-                let objs = store.objs;
-                let resultVal: D;
-                if (k.collect) {
-                  const arr = objs.getOr(k.collect, objLat.bot);
-                  objs = objs.set(k.collect, { ...arr, elements: DJ.join(arr.elements, v) });
-                  resultVal = domain.objRef(k.collect);
-                } else {
-                  // For a `new` frame the result is the returned value when it is an
-                  // object, otherwise the freshly-constructed `this` object.
-                  resultVal = k.newObj && domain.elimObj(v).isEmpty() ? domain.objRef(k.newObj) : v;
-                }
-                // Restore the caller's time captured in the frame, and bind the
-                // returned value in the caller's context (not the callee's).
-                const bound = bindVar(k.env, store.vals, k.name, resultVal, k.time);
-                const store2: Store<Ctx, D> = {
-                  vals: bound.vals,
-                  konts: store.konts,
-                  objs,
-                  counts: store.counts,
-                };
-                const successor: ControlState<Ctx> = {
-                  control: k.body,
-                  env: bound.env,
-                  kaddr: k.next,
-                  time: k.time,
-                };
-                return M.bind(M.put(store2), () => M.unit(successor));
-              }),
-            );
+            return returnToKont(M, v, c.kaddr, store);
           }
 
           case "let": {
@@ -1284,6 +1365,27 @@ export function makeMachine<D>(
                   v = domain.objRef(oaddr);
                   break;
                 }
+                case "shapedTop": {
+                  // A checked-tier import summary's object: the DECLARED hidden
+                  // class (name + representation per field, re-interned locally)
+                  // with every field value ⊤ — the shape is a guardable fact,
+                  // the values deliberately are not (another module may mutate
+                  // the underlying object; see core.ts ImportSummary.shape).
+                  const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
+                  let fields = FinMap.empty<PropName, D>(propK);
+                  for (const [k] of r.fields) fields = fields.joinAt(DJ, k, domain.top);
+                  const shape = shapes.fromFields(r.fields);
+                  ({ objs, counts } = installObj(objs, counts, oaddr, {
+                    shapes: FinSet.of(shapeKey, shape),
+                    fields,
+                    accessors: FinMap.empty(propK),
+                    proto: FinSet.empty(oak),
+                    elements: DJ.bot,
+                    open: true, // other modules may add fields we can't see
+                  }));
+                  v = domain.objRef(oaddr);
+                  break;
+                }
                 case "objectCreate": {
                   // Allocate a fresh object with the given prototype (no own fields).
                   const oaddr: OAddr<Ctx> = { loc: r.loc, time: c.time };
@@ -1323,11 +1425,13 @@ export function makeMachine<D>(
                   const objV = atomEval(r.obj, c.env, store);
                   // ⊥ receiver: no value, not "undefined" (cf. resolveProp).
                   let out = domain.isBottom(objV) ? DJ.bot : domain.lit(litUndef);
-                  if (domain.isTop(objV)) out = DJ.join(out, domain.top); // unknown receiver: any value
+                  if (domain.isTop(objV) || !domain.elimFnSummary(objV).isEmpty())
+                    out = DJ.join(out, domain.top); // unknown receiver: any value
                   for (const oaddr of domain.elimObj(objV)) {
                     const o = objs.getOr(oaddr, objLat.bot);
                     out = DJ.join(out, o.elements);
                     if (!numericKey) for (const fv of o.fields.values()) out = DJ.join(out, fv);
+                    if (o.open) out = DJ.join(out, domain.top); // untracked fields may exist
                   }
                   v = out;
                   break;
@@ -1357,12 +1461,14 @@ export function makeMachine<D>(
                     for (const name of o.fields.keys()) out = DJ.join(out, domain.lit(litStr(name)));
                     for (const name of o.accessors.keys()) out = DJ.join(out, domain.lit(litStr(name)));
                     if (!DJ.lte(o.elements, DJ.bot)) out = DJ.join(out, domain.topString());
+                    if (o.open) out = DJ.join(out, domain.topString()); // untracked enumerable names
                     for (const p of o.proto) collect(p);
                   };
                   const keysObjV = atomEval(r.obj, c.env, store);
                   // An unknown receiver may have any enumerable key (keys are
                   // always strings, so ⊤-string is the precise degradation).
-                  if (domain.isTop(keysObjV)) out = DJ.join(out, domain.topString());
+                  if (domain.isTop(keysObjV) || !domain.elimFnSummary(keysObjV).isEmpty())
+                    out = DJ.join(out, domain.topString());
                   for (const oaddr of domain.elimObj(keysObjV)) collect(oaddr);
                   v = out;
                   break;
@@ -1376,7 +1482,8 @@ export function makeMachine<D>(
                   // degrades to ⊤ and counts as an unknown-call-class event.
                   const src = atomEval(r.obj, c.env, store);
                   let out: D = DJ.bot;
-                  let degraded = domain.isTop(src) || !domain.elimClo(src).isEmpty();
+                  let degraded =
+                    domain.isTop(src) || !domain.elimClo(src).isEmpty() || !domain.elimFnSummary(src).isEmpty();
                   for (const oaddr of domain.elimObj(src)) {
                     const o = objs.getOr(oaddr, objLat.bot);
                     if (DJ.lte(o.elements, DJ.bot)) degraded = true;
@@ -1474,16 +1581,26 @@ export function makeMachine<D>(
               const fnVal = atomEval(r.fn, c.env, store);
               const thisVal = atomEval(r.thisArg, c.env, store);
               const clos = domain.elimClo(fnVal).toArray();
-              if (clos.length === 0) {
+              // callable summaries: bind the ⊤-argument result (still an
+              // open-world call — recordSummarizedCall counts both ways)
+              const sumBranches = domain
+                .elimFnSummary(fnVal)
+                .toArray()
+                .map((fs) => {
+                  recordSummarizedCall(r.loc);
+                  const res = fnSummaryResult(fs, r.loc, c.time, store.objs, store.counts);
+                  return degrade(res.v, { ...store, objs: res.objs, counts: res.counts });
+                });
+              if (clos.length === 0 && sumBranches.length === 0) {
                 recordUnknownCall(r.loc);
                 return degrade(domain.top, store); // unknown callee could return anything
               }
-              return mplusAll(
-                M,
-                clos.map((clo) =>
+              return mplusAll(M, [
+                ...sumBranches,
+                ...clos.map((clo) =>
                   enterClosure(M, clo, argVals, r.loc, r.loc, c.time, store, baseFrame, c.kaddr, thisVal),
                 ),
-              );
+              ]);
             }
 
             if (r.tag === "method") {
@@ -1501,6 +1618,13 @@ export function makeMachine<D>(
                   branches.push(
                     enterClosure(M, clo, argVals, r.loc, ctxLoc, c.time, store, baseFrame, c.kaddr, thisVal),
                   );
+                }
+                // a method slot holding a callable summary (a namespace's
+                // function field): bind its ⊤-argument result
+                for (const fs of domain.elimFnSummary(methodVal).toArray()) {
+                  recordSummarizedCall(r.loc);
+                  const res = fnSummaryResult(fs, r.loc, c.time, store.objs, store.counts);
+                  branches.push(degrade(res.v, { ...store, objs: res.objs, counts: res.counts }));
                 }
                 // A modeled intrinsic method resolved through the prototype chain
                 // (`Math.floor` on the namespace object, `arr.push` on `Array.prototype`):
@@ -1617,10 +1741,26 @@ export function makeMachine<D>(
             }
             const frame: Kont<Ctx> = newObj ? { ...baseFrame, newObj } : baseFrame;
             const targets = domain.elimClo(fv).toArray();
+            // Callable summaries dispatch for plain calls only: `new` through an
+            // imported function has construct semantics the ⊤-argument result
+            // doesn't describe (this-binding, prototype) — it stays a plain
+            // unknown callee.
+            const sumBranches =
+              r.tag === "call"
+                ? domain
+                    .elimFnSummary(fv)
+                    .toArray()
+                    .map((fs) => {
+                      recordSummarizedCall(r.loc);
+                      const res = fnSummaryResult(fs, r.loc, c.time, store1.objs, store1.counts);
+                      return degrade(res.v, { ...store1, objs: res.objs, counts: res.counts });
+                    })
+                : [];
             if (targets.length === 0) {
-              // If an intrinsic handled it, take those branches; otherwise it is a
-              // genuine unknown callee — record and degrade.
-              if (intrBranches.length > 0) return mplusAll(M, intrBranches);
+              // If an intrinsic or summary handled it, take those branches;
+              // otherwise it is a genuine unknown callee — record and degrade.
+              if (intrBranches.length > 0 || sumBranches.length > 0)
+                return mplusAll(M, [...intrBranches, ...sumBranches]);
               recordUnknownCall(r.loc);
               // An unknown callee — plain call or `new` — could return anything
               // (⊤). Binding the freshly-allocated `this` for an unknown `new`
@@ -1631,6 +1771,7 @@ export function makeMachine<D>(
             }
             return mplusAll(M, [
               ...intrBranches,
+              ...sumBranches,
               ...targets.map((clo) =>
                 enterClosure(M, clo, argVals, r.loc, r.loc, c.time, store1, frame, c.kaddr, thisVal),
               ),
@@ -1693,14 +1834,26 @@ export function makeMachine<D>(
             const fv = atomEval(e.fn, c.env, store);
             const argVals = e.args.map((a) => atomEval(a, c.env, store));
             const targets = domain.elimClo(fv).toArray();
+            // A callable summary in tail position: the summary has no body to
+            // enter, so "returning" its ⊤-argument result happens right here —
+            // deliver it to the current continuation (`return f(x)` with an
+            // imported `f` no longer kills the path).
+            const sumBranches = domain
+              .elimFnSummary(fv)
+              .toArray()
+              .map((fs) => {
+                recordSummarizedCall(e.loc);
+                const res = fnSummaryResult(fs, e.loc, c.time, store.objs, store.counts);
+                return returnToKont(M, res.v, c.kaddr, { ...store, objs: res.objs, counts: res.counts });
+              });
             // A tail call with no callee has no `let` body to degrade into —
             // the path simply ends — but record it so `metrics.unknownCalls`
             // still reports the open world.
-            if (targets.length === 0) recordUnknownCall(e.loc);
-            return mplusAll(
-              M,
-              targets.map((clo) => enterClosure(M, clo, argVals, e.loc, e.loc, c.time, store, null, c.kaddr, null)),
-            );
+            if (targets.length === 0 && sumBranches.length === 0) recordUnknownCall(e.loc);
+            return mplusAll(M, [
+              ...sumBranches,
+              ...targets.map((clo) => enterClosure(M, clo, argVals, e.loc, e.loc, c.time, store, null, c.kaddr, null)),
+            ]);
           }
 
           case "throw":
@@ -1821,6 +1974,7 @@ export function makeMachine<D>(
     accessorSetSites,
     specObservations: specObs,
     unknownCallSites,
+    summarizedCallSites,
     capStats,
     inject,
     step,

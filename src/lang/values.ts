@@ -17,7 +17,7 @@
 import type { Keyable } from "../data/key.js";
 import { FinSet, powersetLattice } from "../data/finset.js";
 import type { JoinSemilattice } from "../lattice.js";
-import type { BinOp, Lit, UnOp } from "./core.js";
+import type { BinOp, ImportSummary, Lit, UnOp } from "./core.js";
 import type { Closure, OAddr } from "./state.js";
 import type { TypeSig } from "./shapes.js";
 
@@ -72,6 +72,14 @@ export interface ValDomain<Ctx, D> {
    * by `id`, e.g. `"Math.floor"` or `"Array"`) — cf. `clo`, dispatched in the call
    * path via {@link elimIntrinsic}. */
   intrinsic(id: string): D;
+  /**
+   * Introduce a cross-module CALLABLE summary (an imported function whose
+   * body lives in another module) — cf. `clo`; dispatched in the call path
+   * via {@link elimFnSummary}, which binds the summary's ⊤-argument result
+   * instead of degrading the whole call to `⊤`.  Unrepresentable in the
+   * concrete domain (no body to run exactly): maps to `⊤` there.
+   */
+  fnSummary(fs: FnSummary): D;
 
   /** `δ⟦⊕⟧`: abstract binary/unary primitives. */
   binop(op: BinOp, l: D, r: D): D;
@@ -85,6 +93,8 @@ export interface ValDomain<Ctx, D> {
   elimObj(d: D): FinSet<OAddr<Ctx>>;
   /** Which modeled intrinsics this value may be (for calls) — cf. `elimClo`. */
   elimIntrinsic(d: D): FinSet<string>;
+  /** Which cross-module callable summaries this value may be — cf. `elimClo`. */
+  elimFnSummary(d: D): FinSet<FnSummary>;
 
   /**
    * The representation (type signature) of a value — used as the field type in a
@@ -95,6 +105,17 @@ export interface ValDomain<Ctx, D> {
 
   /** Is this the empty value (a stuck / unreachable result)? */
   isBottom(d: D): boolean;
+
+  /**
+   * Project a value to a host-neutral {@link ImportSummary} — the export
+   * side of cross-module linking.  Defined only where the projection is
+   * EXACT-or-wider on the summary's primitive components: a value holding
+   * anything a summary cannot carry (closures, objects, intrinsics,
+   * bigints, `⊤`) returns `undefined` — no summary — rather than a lossy
+   * one, so consumers can trust every summary that exists.  `⊥` also
+   * returns `undefined`: an unreached binding is not a fact.
+   */
+  toSummary?(d: D): ImportSummary | undefined;
 
   /**
    * EXACT concretization — the capability that separates a *reference
@@ -114,6 +135,21 @@ export interface ValDomain<Ctx, D> {
 
 /** The primitive JS values exact intrinsic evaluation traffics in. */
 export type Prim = number | string | boolean | null | undefined;
+
+/**
+ * An imported function's callable summary as a lattice constituent: its
+ * program-wide id and its ⊤-argument result payload (see
+ * {@link ImportSummary}.fn).  Keyed by id + serialized result so two hosts
+ * intern identically and joins are deterministic.
+ */
+export interface FnSummary {
+  readonly id: string;
+  readonly result?: ImportSummary;
+}
+
+const fnSummaryK: Keyable<FnSummary> = {
+  key: (fs) => `${fs.id}|${fs.result !== undefined ? JSON.stringify(fs.result) : "-"}`,
+};
 
 // ===========================================================================
 // Concrete domain:  D = ℘(CVal)
@@ -490,11 +526,28 @@ export function concreteDomain<Ctx>(
   const K = cvalKey(closureK, oaddrK);
   const lattice = powersetLattice(K);
   const topSet = FinSet.of<CVal<Ctx>>(K, { t: "top" });
+  // An import summary concretizes to the finite set it enumerates; a
+  // widened component ("any") is an infinite set the concrete domain cannot
+  // hold, so the whole value degrades to ⊤ (sound, and excluded from
+  // differential comparison like every other ⊤-producing run).
+  const summaryToCSet = (s: ImportSummary): FinSet<CVal<Ctx>> => {
+    // constituents the concrete domain cannot represent exactly degrade the
+    // whole value (no partial tops here)
+    if (s.fn !== undefined || s.shape !== undefined || s.fields !== undefined) return topSet;
+    if (s.nums === "any" || s.strs === "any") return topSet;
+    let out = FinSet.empty<CVal<Ctx>>(K);
+    if (s.nums) for (const v of s.nums) out = out.add({ t: "num", v });
+    if (s.strs) for (const v of s.strs) out = out.add({ t: "str", v });
+    if (s.bools) for (const v of s.bools) out = out.add({ t: "bool", v });
+    if (s.nullP) out = out.add({ t: "null" });
+    if (s.undefP) out = out.add({ t: "undef" });
+    return out.isEmpty() ? topSet : out; // an empty summary carries no information
+  };
   return {
     name: "concrete (℘CVal)",
     lattice,
     key: { key: (s) => `{${[...s].map(K.key).sort().join(",")}}` },
-    lit: (l) => FinSet.of(K, litToCVal<Ctx>(l)),
+    lit: (l) => (l.kind === "summary" ? summaryToCSet(l.summary) : FinSet.of(K, litToCVal<Ctx>(l))),
     top: topSet,
     isTop: (d) => [...d].some((v) => v.t === "top"),
     // ⊤-typed values are not representable concretely (the concrete interpreter
@@ -505,6 +558,7 @@ export function concreteDomain<Ctx>(
     clo: (c) => FinSet.of<CVal<Ctx>>(K, { t: "clo", c }),
     objRef: (addr) => FinSet.of<CVal<Ctx>>(K, { t: "obj", addr }),
     intrinsic: (id) => FinSet.of<CVal<Ctx>>(K, { t: "intr", id }),
+    fnSummary: () => topSet, // no body to run exactly: degrade (never a made-up value)
     binop: (op, l, r) => {
       let out = FinSet.empty<CVal<Ctx>>(K);
       for (const a of l) for (const b of r) out = out.add(applyBinC(op, a, b));
@@ -538,12 +592,54 @@ export function concreteDomain<Ctx>(
       for (const v of d) if (v.t === "intr") out = out.add(v.id);
       return out;
     },
+    elimFnSummary: () => FinSet.empty<FnSummary>(fnSummaryK), // summaries map to ⊤ here
     typeSig: (d) => {
       const tags = new Set<string>();
       for (const v of d) tags.add(cvalTag(v));
       return renderTags(tags);
     },
     isBottom: (d) => d.isEmpty(),
+    toSummary: (d) => {
+      const nums: number[] = [];
+      const strs: string[] = [];
+      const bools: boolean[] = [];
+      let nullP = false;
+      let undefP = false;
+      for (const v of d) {
+        switch (v.t) {
+          case "num":
+            nums.push(v.v);
+            break;
+          case "str":
+            strs.push(v.v);
+            break;
+          case "bool":
+            bools.push(v.v);
+            break;
+          case "null":
+            nullP = true;
+            break;
+          case "undef":
+            undefP = true;
+            break;
+          default:
+            return undefined; // bigint/closure/object/intrinsic/⊤: not expressible
+        }
+      }
+      if (nums.length === 0 && strs.length === 0 && bools.length === 0 && !nullP && !undefP)
+        return undefined; // ⊥ — an unreached binding is not a fact
+      // sorted components so a summary serializes identically across hosts
+      nums.sort((a, b) => a - b);
+      strs.sort();
+      bools.sort();
+      return {
+        ...(nums.length > 0 ? { nums } : {}),
+        ...(strs.length > 0 ? { strs } : {}),
+        ...(bools.length > 0 ? { bools } : {}),
+        ...(nullP ? { nullP } : {}),
+        ...(undefP ? { undefP } : {}),
+      };
+    },
     concretize: (d) => {
       const items = d.toArray();
       if (items.length !== 1) return null;
@@ -608,6 +704,8 @@ function litToCVal<Ctx>(l: Lit): CVal<Ctx> {
       return { t: "undef" };
     case "top":
       return { t: "top" };
+    case "summary":
+      return { t: "top" }; // unreachable: `lit` routes summaries to summaryToCSet
   }
 }
 
@@ -658,6 +756,8 @@ export interface AVal<Ctx> {
   readonly objs: FinSet<OAddr<Ctx>>;
   /** Modeled standard-library intrinsics this value may be (ids like `"Math.floor"`). */
   readonly intrinsics: FinSet<string>;
+  /** Cross-module callable summaries this value may be (imported functions). */
+  readonly fnSums: FinSet<FnSummary>;
 }
 
 /** Widening bound for numeric/string constant sets before collapsing to `⊤`. */
@@ -678,6 +778,7 @@ export function abstractDomain<Ctx>(
   const objsL = powersetLattice(oaddrK);
   const intrK: Keyable<string> = { key: (s) => s };
   const intrL = powersetLattice(intrK);
+  const fnSumsL = powersetLattice(fnSummaryK);
 
   const bot: AVal<Ctx> = {
     topP: false,
@@ -689,6 +790,7 @@ export function abstractDomain<Ctx>(
     clos: closL.bot,
     objs: objsL.bot,
     intrinsics: intrL.bot,
+    fnSums: fnSumsL.bot,
   };
 
   /** The one canonical ⊤ value — every join that involves ⊤ returns exactly this. */
@@ -709,6 +811,7 @@ export function abstractDomain<Ctx>(
       const clos = closL.join(a.clos, b.clos);
       const objs = objsL.join(a.objs, b.objs);
       const intrinsics = intrL.join(a.intrinsics, b.intrinsics);
+      const fnSums = fnSumsL.join(a.fnSums, b.fnSums);
       const nullP = a.nullP || b.nullP;
       const undefP = a.undefP || b.undefP;
       if (
@@ -718,11 +821,12 @@ export function abstractDomain<Ctx>(
         clos === a.clos &&
         objs === a.objs &&
         intrinsics === a.intrinsics &&
+        fnSums === a.fnSums &&
         nullP === a.nullP &&
         undefP === a.undefP
       )
         return a;
-      return { topP: false, nums, strs, bools, nullP, undefP, clos, objs, intrinsics };
+      return { topP: false, nums, strs, bools, nullP, undefP, clos, objs, intrinsics, fnSums };
     },
     lte: (a, b) =>
       b.topP ||
@@ -734,7 +838,8 @@ export function abstractDomain<Ctx>(
         (!a.undefP || b.undefP) &&
         closL.lte(a.clos, b.clos) &&
         objsL.lte(a.objs, b.objs) &&
-        intrL.lte(a.intrinsics, b.intrinsics)),
+        intrL.lte(a.intrinsics, b.intrinsics) &&
+        fnSumsL.lte(a.fnSums, b.fnSums)),
   };
 
   const key: Keyable<AVal<Ctx>> = {
@@ -750,7 +855,19 @@ export function abstractDomain<Ctx>(
         `c:{${[...v.clos].map(closureK.key).sort().join(",")}}`,
         `o:{${[...v.objs].map(oaddrK.key).sort().join(",")}}`,
         `i:{${[...v.intrinsics].sort().join(",")}}`,
+        `f:{${[...v.fnSums].map(fnSummaryK.key).sort().join(",")}}`,
       ].join("|"),
+  };
+
+  // An import summary's per-type component as a ConstSet: `"any"` (or a
+  // constant list past the widening bound) is the type's ⊤.  (`??`-free:
+  // this module is part of the self-hosted compiler and stays inside the
+  // analyzable dialect so maam can analyze its own value domain.)
+  const constsOf = <A,>(K2: Keyable<A>, xs: "any" | ReadonlyArray<A> | undefined): ConstSet<A> => {
+    if (xs === "any" || (xs !== undefined && xs.length > bound))
+      return { top: true, items: FinSet.empty(K2) };
+    if (xs === undefined) return { top: false, items: FinSet.empty(K2) };
+    return { top: false, items: xs.reduce((acc, x) => acc.add(x), FinSet.empty(K2)) };
   };
 
   const num = (n: number): AVal<Ctx> => ({ ...bot, nums: { top: false, items: FinSet.of(numK, n) } });
@@ -769,7 +886,7 @@ export function abstractDomain<Ctx>(
   // ⊤ — and it cannot coerce to one either (only objects, via valueOf/
   // @@toPrimitive, can produce a bigint under ToNumeric).
   const provenBigintFree = (v: AVal<Ctx>): boolean =>
-    !v.topP && v.objs.isEmpty() && v.clos.isEmpty() && v.intrinsics.isEmpty();
+    !v.topP && v.objs.isEmpty() && v.clos.isEmpty() && v.intrinsics.isEmpty() && v.fnSums.isEmpty();
   // ... and of exactly one type (used to sharpen `+`).
   const provenStr = (v: AVal<Ctx>): boolean =>
     provenBigintFree(v) &&
@@ -911,6 +1028,27 @@ export function abstractDomain<Ctx>(
           return { ...bot, undefP: true };
         case "top":
           return TOP;
+        case "summary": {
+          const s = l.summary;
+          const fnSums =
+            s.fn !== undefined
+              ? FinSet.of<FnSummary>(fnSummaryK, {
+                  id: s.fn.id !== undefined ? s.fn.id : "?",
+                  ...(s.fn.result !== undefined ? { result: s.fn.result } : {}),
+                })
+              : fnSumsL.bot;
+          const v: AVal<Ctx> = {
+            ...bot,
+            nums: constsOf(numK, s.nums),
+            strs: constsOf(strK, s.strs),
+            bools: (s.bools === undefined ? [] : s.bools).reduce((acc, b) => acc.add(b), FinSet.empty(boolK)),
+            nullP: s.nullP === true,
+            undefP: s.undefP === true,
+            fnSums,
+          };
+          // an empty summary carries no information: degrade to ⊤, never claim ⊥
+          return lattice.lte(v, bot) ? TOP : v;
+        }
       }
     },
     top: TOP,
@@ -921,6 +1059,7 @@ export function abstractDomain<Ctx>(
     clo: (c) => ({ ...bot, clos: FinSet.of(closureK, c) }),
     objRef: (addr) => ({ ...bot, objs: FinSet.of(oaddrK, addr) }),
     intrinsic: (id) => ({ ...bot, intrinsics: FinSet.of(intrK, id) }),
+    fnSummary: (fs) => ({ ...bot, fnSums: FinSet.of(fnSummaryK, fs) }),
     binop,
     unop: (op, a) => {
       // ⊤ operand: refine by what the operator can produce.  Unary `-` and
@@ -963,7 +1102,7 @@ export function abstractDomain<Ctx>(
           for (const b of a.bools) out = lattice.join(out, str(String(b)));
           if (a.nullP) out = lattice.join(out, str("null"));
           if (a.undefP) out = lattice.join(out, str("undefined"));
-          if (!a.clos.isEmpty() || !a.intrinsics.isEmpty() || !a.objs.isEmpty())
+          if (!a.clos.isEmpty() || !a.intrinsics.isEmpty() || !a.objs.isEmpty() || !a.fnSums.isEmpty())
             out = lattice.join(out, anyStr);
           return out;
         }
@@ -979,7 +1118,8 @@ export function abstractDomain<Ctx>(
           if (!a.bools.isEmpty()) out = lattice.join(out, str("boolean"));
           if (a.undefP) out = lattice.join(out, str("undefined"));
           if (a.nullP) out = lattice.join(out, str("object"));
-          if (!a.clos.isEmpty() || !a.intrinsics.isEmpty()) out = lattice.join(out, str("function"));
+          if (!a.clos.isEmpty() || !a.intrinsics.isEmpty() || !a.fnSums.isEmpty())
+            out = lattice.join(out, str("function"));
           if (!a.objs.isEmpty()) out = lattice.join(out, str("object"));
           return out;
         }
@@ -989,6 +1129,7 @@ export function abstractDomain<Ctx>(
     elimClo: (d) => d.clos,
     elimObj: (d) => d.objs,
     elimIntrinsic: (d) => d.intrinsics,
+    elimFnSummary: (d) => d.fnSums,
     typeSig: (v) => {
       if (v.topP) return "⊤";
       const tags = new Set<string>();
@@ -997,11 +1138,39 @@ export function abstractDomain<Ctx>(
       if (!v.bools.isEmpty()) tags.add("bool");
       if (v.nullP) tags.add("null");
       if (v.undefP) tags.add("undefined");
-      if (!v.clos.isEmpty() || !v.intrinsics.isEmpty()) tags.add("fn");
+      if (!v.clos.isEmpty() || !v.intrinsics.isEmpty() || !v.fnSums.isEmpty()) tags.add("fn");
       if (!v.objs.isEmpty()) tags.add("obj");
       return renderTags(tags);
     },
     isBottom: (d) => lattice.lte(d, bot),
+    toSummary: (v) => {
+      if (v.topP || !v.clos.isEmpty() || !v.objs.isEmpty() || !v.intrinsics.isEmpty()) return undefined;
+      // a pure singleton callable summary round-trips (re-exports of
+      // imported functions chain through the registry)
+      if (!v.fnSums.isEmpty()) {
+        const sums = v.fnSums.toArray();
+        const pure =
+          sums.length === 1 &&
+          !v.nums.top && v.nums.items.isEmpty() &&
+          !v.strs.top && v.strs.items.isEmpty() &&
+          v.bools.isEmpty() && !v.nullP && !v.undefP;
+        if (!pure) return undefined;
+        const fs = sums[0]!;
+        return { fn: { id: fs.id, ...(fs.result !== undefined ? { result: fs.result } : {}) } };
+      }
+      if (lattice.lte(v, bot)) return undefined; // ⊥ — an unreached binding is not a fact
+      // sorted components so a summary serializes identically across hosts
+      const nums = v.nums.items.toArray().sort((a, b) => a - b);
+      const strs = v.strs.items.toArray().sort();
+      const bools = v.bools.toArray().sort();
+      return {
+        ...(v.nums.top ? { nums: "any" as const } : nums.length > 0 ? { nums } : {}),
+        ...(v.strs.top ? { strs: "any" as const } : strs.length > 0 ? { strs } : {}),
+        ...(bools.length > 0 ? { bools } : {}),
+        ...(v.nullP ? { nullP: true } : {}),
+        ...(v.undefP ? { undefP: true } : {}),
+      };
+    },
   };
 
   function elimBoolA(v: AVal<Ctx>): FinSet<boolean> {
@@ -1018,6 +1187,7 @@ export function abstractDomain<Ctx>(
     if (!v.clos.isEmpty()) out = out.add(true);
     if (!v.objs.isEmpty()) out = out.add(true);
     if (!v.intrinsics.isEmpty()) out = out.add(true); // a function object is truthy
+    if (!v.fnSums.isEmpty()) out = out.add(true); // so is an imported function
     return out;
   }
 }

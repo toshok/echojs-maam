@@ -40,6 +40,19 @@ export interface Collecting<C, S> {
  * branch keeping its own store — the `℘(Exp × Store)` relation. Pair with
  * `pathSensitiveMonad`. Most precise, largest state space.
  */
+/**
+ * Thrown when an exploration exceeds its iteration budget — the safety valve
+ * that keeps a total-analysis promise even where precision growth makes a
+ * module's state space explode.  Hosts catch it and degrade (no oracle for
+ * the module), never hang.
+ */
+export class AnalysisBudgetError extends Error {
+  constructor(strategy: string, budget: number) {
+    super(`analysis iteration budget exceeded (${strategy}: > ${budget} worklist steps)`);
+    this.name = "AnalysisBudgetError";
+  }
+}
+
 export function exploreConfigs<C, S>(
   M: RunnableMonad<S>,
   CK: Keyable<C>,
@@ -48,6 +61,7 @@ export function exploreConfigs<C, S>(
   step: Step<C, S>,
   c0: C,
   s0: S,
+  budget = 0,
 ): Collecting<C, S> {
   const configKey = pairKey(CK, SK);
   let seen = FinSet.of<readonly [C, S]>(configKey, [c0, s0]);
@@ -56,6 +70,7 @@ export function exploreConfigs<C, S>(
 
   while (frontier.length > 0) {
     iterations++;
+    if (budget > 0 && iterations > budget) throw new AnalysisBudgetError("path-sensitive", budget);
     const next: Array<readonly [C, S]> = [];
     for (const [c, s] of frontier) {
       for (const [c1, s1] of M.run(step(c), s)) {
@@ -94,6 +109,7 @@ export function exploreFlowSensitive<C, S>(
   s0: S,
   /** Optional abstract GC: restrict a successor's store to what its control state can reach. */
   gc?: (c: C, s: S) => S,
+  budget = 0,
 ): Collecting<C, S> {
   // Per-control-point store: control-key → [control, joined store].
   const store = new Map<string, readonly [C, S]>();
@@ -133,6 +149,7 @@ export function exploreFlowSensitive<C, S>(
     const c = worklist.pop()!;
     queued.delete(CK.key(c));
     iterations++;
+    if (budget > 0 && iterations > budget) throw new AnalysisBudgetError("flow-sensitive", budget);
     const s = store.get(CK.key(c))![1];
     for (const [c1, s1] of M.run(step(c), s)) {
       if (merge(c1, gc ? gc(c1, s1) : s1)) enqueue(c1);
@@ -162,6 +179,7 @@ export function exploreGlobal<C, S>(
   step: Step<C, S>,
   c0: C,
   s0: S,
+  budget = 0,
 ): Collecting<C, S> {
   let reached = FinSet.of<C>(CK, c0);
   let store = s0;
@@ -191,6 +209,7 @@ export function exploreGlobal<C, S>(
       const c = worklist.pop()!;
       queued.delete(CK.key(c));
       iterations++;
+      if (budget > 0 && iterations > budget) throw new AnalysisBudgetError("flow-insensitive", budget);
       for (const [c1, s1] of M.run(step(c), store)) {
         if (!reached.has(c1)) {
           reached = reached.add(c1);

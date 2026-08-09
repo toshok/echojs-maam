@@ -60,6 +60,7 @@ export class FinSet<A> implements Iterable<A> {
   }
 
   union(other: FinSet<A>): FinSet<A> {
+    if (other === this) return this;
     if (other.isEmpty()) return this;
     if (this.isEmpty()) return other;
     // Reference-preserving: if `other ⊆ this` the union is a no-op — return `this`
@@ -94,8 +95,13 @@ export class FinSet<A> implements Iterable<A> {
 
   /** `this ⊆ other` structurally. */
   isSubsetOf(other: FinSet<A>): boolean {
-    if (this.size > other.size) return false;
-    for (const k of this.items.keys()) if (!other.items.has(k)) return false;
+    // identity first: reference-preserving unions return their operand,
+    // so near a fixpoint most subset checks compare a set to itself
+    if (other === this) return true;
+    const mine = this.items;
+    const theirs = other.items;
+    if (mine.size > theirs.size) return false;
+    for (const k of mine.keys()) if (!theirs.has(k)) return false;
     return true;
   }
 

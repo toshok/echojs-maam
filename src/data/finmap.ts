@@ -83,6 +83,10 @@ export class FinMap<K, V> implements Iterable<readonly [K, V]> {
   joinAt(VJ: JoinSemilattice<V>, k: K, v: V): FinMap<K, V> {
     const kk = this.KK.key(k);
     const existing = this.entries_.get(kk);
+    // reference-preserving: `v ⊑ old` means `old ⊔ v = old` — no copy,
+    // and callers detecting change by identity see the truth.  Near a
+    // fixpoint almost every store write adds nothing.
+    if (existing && VJ.lte(v, existing[1])) return this;
     const merged = existing ? VJ.join(existing[1], v) : v;
     const m = new Map(this.entries_);
     m.set(kk, [k, merged]);
@@ -96,10 +100,13 @@ export class FinMap<K, V> implements Iterable<readonly [K, V]> {
    * it once and merges in place. This is the hot path of every store join.
    */
   mergeJoin(VJ: JoinSemilattice<V>, other: FinMap<K, V>): FinMap<K, V> {
-    if (other.entries_.size === 0) return this;
-    if (this.entries_.size === 0) return other;
-    const m = new Map(this.entries_);
-    for (const [kk, e] of other.entries_) {
+    if (other === this) return this;
+    const mine = this.entries_;
+    const theirs = other.entries_;
+    if (theirs.size === 0) return this;
+    if (mine.size === 0) return other;
+    const m = new Map(mine);
+    for (const [kk, e] of theirs) {
       const existing = m.get(kk);
       m.set(kk, existing ? [existing[0], VJ.join(existing[1], e[1])] : e);
     }
@@ -112,21 +119,26 @@ export class FinMap<K, V> implements Iterable<readonly [K, V]> {
    * already `⊑` ours. Lets the driver skip the separate `lte` traversal.
    */
   mergeJoinChanged(VJ: JoinSemilattice<V>, other: FinMap<K, V>): { map: FinMap<K, V>; changed: boolean } {
-    if (other.entries_.size === 0) return { map: this, changed: false };
-    if (this.entries_.size === 0) return { map: other, changed: true };
-    const m = new Map(this.entries_);
-    let changed = false;
-    for (const [kk, e] of other.entries_) {
-      const existing = m.get(kk);
+    if (other === this) return { map: this, changed: false };
+    const mine = this.entries_;
+    const theirs = other.entries_;
+    if (theirs.size === 0) return { map: this, changed: false };
+    if (mine.size === 0) return { map: other, changed: true };
+    // copy-on-first-change: near a fixpoint most joins add nothing, and
+    // the up-front `new Map(this.entries_)` was the whole cost of a
+    // no-op join
+    let m: Map<string, readonly [K, V]> | null = null;
+    for (const [kk, e] of theirs) {
+      const existing = (m ?? mine).get(kk);
       if (!existing) {
+        if (!m) m = new Map(mine);
         m.set(kk, e);
-        changed = true;
       } else if (!VJ.lte(e[1], existing[1])) {
+        if (!m) m = new Map(mine);
         m.set(kk, [existing[0], VJ.join(existing[1], e[1])]);
-        changed = true;
       }
     }
-    return changed ? { map: new FinMap(this.KK, m), changed } : { map: this, changed };
+    return m ? { map: new FinMap(this.KK, m), changed: true } : { map: this, changed: false };
   }
 
   /**

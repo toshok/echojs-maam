@@ -22,20 +22,36 @@ export interface Keyable<A> {
  * object keys hash by identity in both hosts), so the same value
  * object always returns the SAME string instance and downstream map
  * probes hit the pointer-equality fast path.  Primitives pass through
- * unmemoized.  Lifetime: the memo lives exactly as long as the
- * Keyable instance — the factories mint per-analysis instances, and
- * the keyed values are retained by the analysis's own seen-sets
- * anyway, so the memo adds no new retention class.
+ * unmemoized but still interned.  Lifetime: both tables live exactly
+ * as long as the Keyable instance — the factories mint per-analysis
+ * instances, and the keyed values are retained by the analysis's own
+ * seen-sets anyway, so neither adds a new retention class.
+ *
+ * The intern table (content → canonical instance) is the second half:
+ * the fixpoint re-evaluates transfers by minting fresh, equal-content
+ * value objects each iteration, which identity memoization alone
+ * cannot unify — every set/map probe then pays a full string compare
+ * against the stored key.  Interning collapses each distinct key
+ * content to ONE string instance per dictionary, so probes hit the
+ * pointer-equality fast path and the content compare happens once per
+ * fresh object instead of once per probe.
  */
 export function memoKey<A>(K: Keyable<A>): Keyable<A> {
   const memo = new Map<object, string>();
+  const interned = new Map<string, string>();
+  const intern = (k: string): string => {
+    const canon = interned.get(k);
+    if (canon !== undefined) return canon;
+    interned.set(k, k);
+    return k;
+  };
   return {
     key: (a) => {
-      if ((typeof a !== "object" || a === null) && typeof a !== "function") return K.key(a);
+      if ((typeof a !== "object" || a === null) && typeof a !== "function") return intern(K.key(a));
       const o = a as unknown as object;
       let k = memo.get(o);
       if (k === undefined) {
-        k = K.key(a);
+        k = intern(K.key(a));
         memo.set(o, k);
       }
       return k;

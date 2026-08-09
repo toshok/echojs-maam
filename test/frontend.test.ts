@@ -72,11 +72,30 @@ test("normalize rejects out-of-dialect constructs with clear errors", () => {
   const rejects: Array<[string, RegExp]> = [
     [`const f = (x) => x; f(...args);`, /spread/],
     [`const f = ({...r}) => r;`, /object rest/],
-    [`a ?? b;`, /logical operator/],
   ];
   for (const [src, re] of rejects) {
     assert.throws(() => normalizeProgram(parse(src)), re, `expected ${src} to be rejected`);
   }
+});
+
+test("normalize: nullish coalescing and optional chains", () => {
+  assert.deepEqual(concreteResult(`null ?? 7;`), [7]);
+  assert.deepEqual(concreteResult(`undefined ?? 7;`), [7]);
+  assert.deepEqual(concreteResult(`0 ?? 7;`), [0]);
+  assert.deepEqual(concreteResult(`"" ?? 7;`), [""]);
+  assert.deepEqual(concreteResult(`false ?? 7;`), [false]);
+  assert.deepEqual(concreteResult(`const o = { a: 1 }; o?.a;`), [1]);
+  assert.deepEqual(concreteResult(`const o = null; o?.a;`), ["undef"]);
+  assert.deepEqual(concreteResult(`const o = undefined; o?.a?.b;`), ["undef"]);
+  // short-circuit covers the whole chain, not just the next link
+  assert.deepEqual(concreteResult(`const o = null; o?.a.b;`), ["undef"]);
+  assert.deepEqual(concreteResult(`const o = { a: { b: 3 } }; o?.a?.b;`), [3]);
+  assert.deepEqual(concreteResult(`const o = { a: 5 }; o?.["a"];`), [5]);
+  assert.deepEqual(concreteResult(`const f = null; f?.(1);`), ["undef"]);
+  assert.deepEqual(concreteResult(`const f = (x) => x + 1; f?.(1);`), [2]);
+  assert.deepEqual(concreteResult(`const o = { m() { return 9; } }; o.m?.();`), [9]);
+  assert.deepEqual(concreteResult(`const o = {}; o.m?.();`), ["undef"]);
+  assert.deepEqual(concreteResult(`const o = null; o?.m();`), ["undef"]);
 });
 
 test("end-to-end still correct through the ESTree pipeline", () => {

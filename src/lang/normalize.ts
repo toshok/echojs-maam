@@ -1382,15 +1382,35 @@ class Normalizer {
         );
       }
       case "LogicalExpression": {
-        if (e.operator !== "&&" && e.operator !== "||")
-          throw new NormalizeError(`unsupported logical operator \`${e.operator}\` (only && and ||).`);
+        if (e.operator !== "&&" && e.operator !== "||" && e.operator !== "??")
+          throw new NormalizeError(`unsupported logical operator \`${e.operator}\`.`);
         const t = this.fresh.name();
         const cont = k(this.varA(t));
         return this.normAtom(e.left, scope, (lv) => {
           const bindTo = (val: AExp) => this.letE(t, { tag: "atom", loc: this.fresh.loc(), atom: val }, cont);
           const evalRight = this.normAtom(e.right, scope, (rv) => bindTo(rv));
+          if (e.operator === "??") {
+            // `a ?? b`: branch on the nullish test — loose-eq-null is
+            // true exactly for null/undefined
+            const nz = this.fresh.name();
+            return this.letE(
+              nz,
+              { tag: "bin", loc: this.fresh.loc(), op: "==", l: lv, r: this.litA(litNull) },
+              this.ifE(this.varA(nz), evalRight, bindTo(lv)),
+            );
+          }
           return e.operator === "&&" ? this.ifE(lv, evalRight, bindTo(lv)) : this.ifE(lv, bindTo(lv), evalRight);
         });
+      }
+      case "ChainExpression": {
+        // `a?.b`, `a?.[k]`, `f?.(…)`: one shared short-circuit — the
+        // first nullish link binds the WHOLE chain's result to
+        // undefined (spec short-circuit).  Each link is normalized
+        // once; the nullish test is loose-eq-null.
+        const t = this.fresh.name();
+        const cont = k(this.varA(t));
+        const bindTo = (val: AExp) => this.letE(t, { tag: "atom", loc: this.fresh.loc(), atom: val }, cont);
+        return this.normChain(e.expression as EExpr, scope, () => bindTo(this.litA(litUndef)), bindTo);
       }
       case "ConditionalExpression": {
         const t = this.fresh.name();
@@ -1741,6 +1761,81 @@ class Normalizer {
   }
 
   /** A callee must itself be atomic (identifier / literal function). */
+  // --- optional chains -----------------------------------------------------
+  // Lower one link of an optional chain.  `shortCircuit` is the shared
+  // whole-chain exit (bind undefined); an optional link tests its base
+  // with loose-eq-null and either exits or proceeds.  Property reads
+  // are pure in-model (getters lower to defineAccessor, object-literal
+  // getters are rejected), so the optional method call's read-then-
+  // dispatch double read is sound.
+  private normChain(e: EExpr, scope: Scope, shortCircuit: () => Expr, k: (a: AExp) => Expr): Expr {
+    const guardNullish = (a: AExp, proceed: () => Expr): Expr => {
+      const nz = this.fresh.name();
+      return this.letE(
+        nz,
+        { tag: "bin", loc: this.fresh.loc(), op: "==", l: a, r: this.litA(litNull) },
+        this.ifE(this.varA(nz), shortCircuit(), proceed()),
+      );
+    };
+    if (e.type === "MemberExpression") {
+      const getLoc = this.fresh.loc();
+      this.siteSpans.set(getLoc, spanOf(e));
+      const read = (obj: AExp): Expr => {
+        if (e.computed) {
+          const constKey = literalString(e.property as Node);
+          if (constKey !== null) {
+            const t = this.fresh.name();
+            return this.letE(t, { tag: "get", loc: getLoc, obj, key: constKey }, k(this.varA(t)));
+          }
+          return this.normAtom(e.property as EExpr, scope, (keyExpr) => {
+            const t = this.fresh.name();
+            return this.letE(t, { tag: "getDyn", loc: getLoc, obj, keyExpr }, k(this.varA(t)));
+          });
+        }
+        const key = memberKeyName(e);
+        const t = this.fresh.name();
+        return this.letE(t, { tag: "get", loc: getLoc, obj, key }, k(this.varA(t)));
+      };
+      return this.normChain(e.object as EExpr, scope, shortCircuit, (obj) =>
+        e.optional ? guardNullish(obj, () => read(obj)) : read(obj),
+      );
+    }
+    if (e.type === "CallExpression") {
+      const callee = e.callee;
+      if (callee.type === "MemberExpression") {
+        if (callee.computed) throw new NormalizeError("computed method calls in an optional chain are not supported.");
+        const key = memberKeyName(callee);
+        const invoke = (obj: AExp): Expr =>
+          this.normArgs(e.arguments, scope, (as) => {
+            const t = this.fresh.name();
+            return this.letE(t, { tag: "method", loc: this.fresh.loc(), obj, key, args: as }, k(this.varA(t)));
+          });
+        return this.normChain(callee.object as EExpr, scope, shortCircuit, (obj) => {
+          const dispatch = (): Expr => {
+            if (!e.optional) return invoke(obj);
+            // `obj.m?.(…)`: read the method value for the nullish test,
+            // then dispatch with the receiver
+            const fv = this.fresh.name();
+            const getLoc = this.fresh.loc();
+            this.siteSpans.set(getLoc, spanOf(callee));
+            return this.letE(fv, { tag: "get", loc: getLoc, obj, key }, guardNullish(this.varA(fv), () => invoke(obj)));
+          };
+          return callee.optional ? guardNullish(obj, dispatch) : dispatch();
+        });
+      }
+      return this.normChain(callee as EExpr, scope, shortCircuit, (fn) => {
+        const invoke = (): Expr =>
+          this.normArgs(e.arguments, scope, (as) => {
+            const t = this.fresh.name();
+            return this.letE(t, { tag: "call", loc: this.fresh.loc(), fn, args: as }, k(this.varA(t)));
+          });
+        return e.optional ? guardNullish(fn, invoke) : invoke();
+      });
+    }
+    // chain root: an ordinary expression
+    return this.normAtom(e, scope, k);
+  }
+
   private normCallee(callee: EExpr | { type: "Super" }, scope: Scope, k: (fn: AExp) => Expr): Expr {
     if (callee.type === "Super")
       throw new NormalizeError("`super` calls are not supported.");
@@ -1922,7 +2017,26 @@ class Normalizer {
   ): Expr {
     if (!oExpr || !keyExpr || !descExpr) throw new NormalizeError("Object.defineProperty needs three arguments.");
     const key = literalString(keyExpr);
-    if (key === null) throw new NormalizeError("Object.defineProperty requires a string-literal key.");
+    if (key === null) {
+      // Dynamic key.  A DATA define (the host's class desugar emits
+      // these for `[Symbol.iterator]()` methods) is a dynamic-key own
+      // write: putDyn widens the object's key tracking soundly.
+      // Dynamic-key ACCESSOR installs stay rejected — the getter's
+      // call effects would be unmodeled.
+      if (descExpr.type !== "ObjectExpression")
+        throw new NormalizeError("Object.defineProperty requires a literal descriptor object.");
+      const dynValue = descriptorField(descExpr, "value");
+      if (descriptorField(descExpr, "get") || descriptorField(descExpr, "set") || !dynValue)
+        throw new NormalizeError("Object.defineProperty with a dynamic key requires a `value` descriptor.");
+      return this.normAtom(oExpr, scope, (o) =>
+        this.normAtom(keyExpr, scope, (kx) =>
+          this.normAtom(dynValue, scope, (v) => {
+            const t = this.fresh.name();
+            return this.letE(t, { tag: "putDyn", loc: this.fresh.loc(), obj: o, keyExpr: kx, val: v }, k(this.varA(t)));
+          }),
+        ),
+      );
+    }
     if (descExpr.type !== "ObjectExpression")
       throw new NormalizeError("Object.defineProperty requires a literal descriptor object.");
     const value = descriptorField(descExpr, "value");

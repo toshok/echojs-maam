@@ -382,6 +382,10 @@ class Normalizer {
     private readonly hooks?: ImportHooks,
   ) {}
 
+  /** Per-function hoist-scan ref sets, memoized on node identity
+   * (functionSubtreeRefs — pure per subtree; enclosing lists re-query
+   * the same fn nodes once per statement position). */
+  private readonly fnRefsMemo = new Map<AnyNode, ReadonlySet<string>>();
   /** Nodes spliced into multiple binding sites — poisoned, never reported. */
   private readonly poisonedNodes = new Set<Node>();
   /** Nodes whose mapping came from `normNamed` and still owes its inner lowering one alias. */
@@ -546,14 +550,14 @@ class Normalizer {
     });
 
     const hoistedFuncRefs = new Set<string>();
-    for (const f of funcs) functionSubtreeRefs(f as unknown as AnyNode, hoistedFuncRefs);
+    for (const f of funcs) functionSubtreeRefs(f as unknown as AnyNode, hoistedFuncRefs, this.fnRefsMemo);
     // Earliest closure-reference position per name (hoisted declarations count
     // as −1; `∃ ref ≤ X` ⟺ `min(refs) ≤ X`, so the minimum suffices).
     const minRef = new Map<string, number>();
     for (const n of hoistedFuncRefs) minRef.set(n, -1);
     rest.forEach((s, i) => {
       const refs = new Set<string>();
-      functionSubtreeRefs(s as unknown as AnyNode, refs);
+      functionSubtreeRefs(s as unknown as AnyNode, refs, this.fnRefsMemo);
       for (const n of refs) if (!minRef.has(n)) minRef.set(n, i);
     });
 
@@ -2460,16 +2464,170 @@ type AnyNode = { readonly type?: string } & Record<string, unknown>;
 
 const FUNCTION_NODE_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
 
-/** Recurse into every ESTree child of `n` (arrays and single nodes). */
-function walkChildren(n: AnyNode, visit: (c: AnyNode) => void): void {
+/** One candidate child (or array of candidates): visit every element that
+ * looks like a node.  The same filter the generic walk applies per key. */
+function visitMaybe(v: unknown, visit: (c: AnyNode) => void): void {
+  if (Array.isArray(v)) {
+    for (const c of v) if (c && typeof c === "object" && typeof (c as AnyNode).type === "string") visit(c as AnyNode);
+  } else if (v && typeof v === "object" && typeof (v as AnyNode).type === "string") {
+    visit(v as AnyNode);
+  }
+}
+
+/** The generic child walk: every enumerable property that holds a node (or
+ * array of nodes).  The soundness backstop for node types the fast walk
+ * below does not enumerate — over-approximation must never turn into
+ * under-approximation through a missing key. */
+function walkChildrenGeneric(n: AnyNode, visit: (c: AnyNode) => void): void {
   for (const key of Object.keys(n)) {
     if (key === "loc" || key === "range") continue;
-    const v = n[key];
-    if (Array.isArray(v)) {
-      for (const c of v) if (c && typeof c === "object" && typeof (c as AnyNode).type === "string") visit(c as AnyNode);
-    } else if (v && typeof v === "object" && typeof (v as AnyNode).type === "string") {
-      visit(v as AnyNode);
-    }
+    visitMaybe(n[key], visit);
+  }
+}
+
+/** Recurse into every ESTree child of `n` (arrays and single nodes).
+ *
+ * The common node types dispatch through literal-key accesses (compiled,
+ * these are monomorphic per-arm property loads; the generic walk's
+ * `Object.keys` + dynamic reads were the hottest property traffic in the
+ * whole self-hosted analysis).  Key order matches the builders'
+ * property-creation order — the walk feeds insertion-ordered Sets whose
+ * order is observable downstream (degradation accounting).  Types not
+ * listed — including dialect nodes with unusual fields — take the generic
+ * walk unchanged. */
+function walkChildren(n: AnyNode, visit: (c: AnyNode) => void): void {
+  const a = n as Record<string, unknown>;
+  switch (n.type) {
+    case "Identifier":
+    case "Literal":
+    case "ThisExpression":
+    case "EmptyStatement":
+    case "DebuggerStatement":
+      return;
+    case "ExpressionStatement":
+      visitMaybe(a.expression, visit);
+      return;
+    case "BlockStatement":
+    case "Program":
+      visitMaybe(a.body, visit);
+      return;
+    case "MemberExpression":
+      visitMaybe(a.object, visit);
+      visitMaybe(a.property, visit);
+      return;
+    case "CallExpression":
+    case "NewExpression":
+      visitMaybe(a.callee, visit);
+      visitMaybe(a.arguments, visit);
+      return;
+    case "BinaryExpression":
+    case "LogicalExpression":
+    case "AssignmentExpression":
+      visitMaybe(a.left, visit);
+      visitMaybe(a.right, visit);
+      return;
+    case "ConditionalExpression":
+    case "IfStatement":
+      visitMaybe(a.test, visit);
+      visitMaybe(a.consequent, visit);
+      visitMaybe(a.alternate, visit);
+      return;
+    case "VariableDeclaration":
+      visitMaybe(a.declarations, visit);
+      return;
+    case "VariableDeclarator":
+      visitMaybe(a.id, visit);
+      visitMaybe(a.init, visit);
+      return;
+    case "ReturnStatement":
+    case "ThrowStatement":
+    case "UnaryExpression":
+    case "UpdateExpression":
+    case "YieldExpression":
+    case "AwaitExpression":
+    case "SpreadElement":
+    case "RestElement":
+      visitMaybe(a.argument, visit);
+      return;
+    case "FunctionDeclaration":
+    case "FunctionExpression":
+    case "ArrowFunctionExpression":
+      // old-esprima/echojs dialect: parallel `defaults` and a trailing
+      // `rest` identifier ride beside `params`
+      visitMaybe(a.id, visit);
+      visitMaybe(a.params, visit);
+      visitMaybe(a.defaults, visit);
+      visitMaybe(a.rest, visit);
+      visitMaybe(a.body, visit);
+      return;
+    case "ObjectExpression":
+    case "ObjectPattern":
+      visitMaybe(a.properties, visit);
+      return;
+    case "Property":
+      visitMaybe(a.key, visit);
+      visitMaybe(a.value, visit);
+      return;
+    case "ArrayExpression":
+    case "ArrayPattern":
+      visitMaybe(a.elements, visit);
+      return;
+    case "SequenceExpression":
+      visitMaybe(a.expressions, visit);
+      return;
+    case "ForStatement":
+      visitMaybe(a.init, visit);
+      visitMaybe(a.test, visit);
+      visitMaybe(a.update, visit);
+      visitMaybe(a.body, visit);
+      return;
+    case "ForInStatement":
+    case "ForOfStatement":
+      visitMaybe(a.left, visit);
+      visitMaybe(a.right, visit);
+      visitMaybe(a.body, visit);
+      return;
+    case "WhileStatement":
+      visitMaybe(a.test, visit);
+      visitMaybe(a.body, visit);
+      return;
+    case "DoWhileStatement":
+      // creation order puts body before test — the generic walk visited
+      // it that way, and Set insertion order is observable downstream
+      visitMaybe(a.body, visit);
+      visitMaybe(a.test, visit);
+      return;
+    case "SwitchStatement":
+      visitMaybe(a.discriminant, visit);
+      visitMaybe(a.cases, visit);
+      return;
+    case "SwitchCase":
+      visitMaybe(a.test, visit);
+      visitMaybe(a.consequent, visit);
+      return;
+    case "LabeledStatement":
+      visitMaybe(a.label, visit);
+      visitMaybe(a.body, visit);
+      return;
+    case "BreakStatement":
+    case "ContinueStatement":
+      visitMaybe(a.label, visit);
+      return;
+    case "TryStatement":
+      // both dialects: acorn {block, handler, finalizer}; old-esprima
+      // adds parallel handlers/guardedHandlers arrays
+      visitMaybe(a.block, visit);
+      visitMaybe(a.handlers, visit);
+      visitMaybe(a.handler, visit);
+      visitMaybe(a.guardedHandlers, visit);
+      visitMaybe(a.finalizer, visit);
+      return;
+    case "CatchClause":
+      visitMaybe(a.param, visit);
+      visitMaybe(a.body, visit);
+      return;
+    default:
+      walkChildrenGeneric(n, visit);
   }
 }
 
@@ -2503,9 +2661,22 @@ function identifierRefs(root: AnyNode, out: Set<string>): void {
  * parameter names (a cheap shadow filter; inner locals/params of NESTED
  * functions are not filtered — over-approximate by design).
  */
-function functionSubtreeRefs(root: AnyNode, out: Set<string>): void {
+function functionSubtreeRefs(
+  root: AnyNode,
+  out: Set<string>,
+  memo?: Map<AnyNode, ReadonlySet<string>>,
+): void {
   const visit = (n: AnyNode): void => {
     if (FUNCTION_NODE_TYPES.has(n.type ?? "")) {
+      // The filtered ref set is a pure function of the fn subtree, and
+      // enclosing statement lists re-scan the same fn nodes once per
+      // statement position — memo on node identity collapses the
+      // rescans (same computation, same insertion order).
+      const hit = memo?.get(n);
+      if (hit !== undefined) {
+        for (const r of hit) out.add(r);
+        return;
+      }
       const params = new Set<string>();
       // Binding names only (patternNames walks pattern LEAVES — an ES6 default's
       // right-hand side is an expression, not a binding, and must stay in refs).
@@ -2525,7 +2696,10 @@ function functionSubtreeRefs(root: AnyNode, out: Set<string>): void {
       for (const d of (n["defaults"] as (AnyNode | null)[] | undefined) ?? []) {
         if (d && typeof d.type === "string") identifierRefs(d, refs);
       }
-      for (const r of refs) if (!params.has(r)) out.add(r);
+      const filtered = new Set<string>();
+      for (const r of refs) if (!params.has(r)) filtered.add(r);
+      memo?.set(n, filtered);
+      for (const r of filtered) out.add(r);
       return;
     }
     walkChildren(n, visit);
